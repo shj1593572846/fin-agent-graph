@@ -1,0 +1,62 @@
+[
+  {
+    "code": "002475",
+    "name": "立讯精密",
+    "score": 3,
+    "above_ratio": 80.0,
+    "min_bias": -0.0709022730303205,
+    "shrink_ratio": 100.0,
+    "has_rebound_volume": false,
+    "rebound_str": "温和承接",
+    "recovery_time": "1分钟收回",
+    "trigger_time": "09:33",
+    "tag": "⭐⭐⭐【强力符合】",
+    "latest_price": 44.67,
+    "pct": 0.04479283314670353
+  },
+  {
+    "code": "000858",
+    "name": "五 粮 液",
+    "score": 2,
+    "above_ratio": 80.0,
+    "min_bias": -0.03272852702633729,
+    "shrink_ratio": 0.0,
+    "has_rebound_volume": false,
+    "rebound_str": "温和承接",
+    "recovery_time": "1分钟收回",
+    "trigger_time": "09:32",
+    "tag": "⭐⭐  【部分符合】",
+    "latest_price": 72.07,
+    "pct": 1.0799438990182273
+  },
+  {
+    "code": "600900",
+    "name": "长江电力",
+    "score": 2,
+    "above_ratio": 60.0,
+    "min_bias": -0.06272199802858741,
+    "shrink_ratio": 100.0,
+    "has_rebound_volume": false,
+    "rebound_str": "温和承接",
+    "recovery_time": "1分钟收回",
+    "trigger_time": "09:32",
+    "tag": "⭐⭐  【部分符合】",
+    "latest_price": 29.38,
+    "pct": -0.7432432432432513
+  },
+  {
+    "code": "000333",
+    "name": "美的集团",
+    "score": 2,
+    "above_ratio": 20.0,
+    "min_bias": -0.22500823729977612,
+    "shrink_ratio": 100.0,
+    "has_rebound_volume": false,
+    "rebound_str": "温和承接",
+    "recovery_time": "1分钟收回",
+    "trigger_time": "09:35",
+    "tag": "⭐⭐  【部分符合】",
+    "latest_price": 84.6,
+    "pct": -0.1298547987250613
+  }
+]
