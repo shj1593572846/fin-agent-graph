@@ -27,7 +27,11 @@ def get_project_root() -> str:
     """获取项目根目录（兼容在 agent 子目录或根目录下运行）"""
     curr = os.path.dirname(os.path.abspath(__file__))
     parent = os.path.dirname(curr)
-    if os.path.exists(os.path.join(curr, "stock_kline_all.csv")) or os.path.exists(os.path.join(curr, "kline_data")):
+    if (
+        os.path.exists(os.path.join(curr, "stock_data"))
+        or os.path.exists(os.path.join(curr, "stock_kline_all.csv"))
+        or os.path.exists(os.path.join(curr, "kline_data"))
+    ):
         return curr
     return parent
 
@@ -289,7 +293,9 @@ def _get_all_market_stocks() -> list[dict]:
 
     # 1. 优先尝试从本地已有汇总文件中提取全部个股代码与简称
     root_dir = get_project_root()
-    summary_filepath = os.path.join(root_dir, "stock_kline_all.csv")
+    summary_filepath = os.path.join(root_dir, "stock_data", "stock_kline_all.csv")
+    if not os.path.exists(summary_filepath):
+        summary_filepath = os.path.join(root_dir, "stock_kline_all.csv")
     if os.path.exists(summary_filepath) and os.path.getsize(summary_filepath) > 102400:
         try:
             sdf = pd.read_csv(summary_filepath, usecols=["股票代码", "股票简称"], dtype=str)
@@ -510,14 +516,23 @@ def download_stock_day(topic: str = "", limit: int = 60) -> str:
 
     # 0. 极速缓存检测：如果本地汇总文件存在且数据量充足，直接秒级复用！
     root_dir = get_project_root()
+    stock_data_dir = os.path.join(root_dir, "stock_data")
+    os.makedirs(stock_data_dir, exist_ok=True)
     summary_filename = f"{topic_clean}_kline_all.csv" if topic_clean else "stock_kline_all.csv"
-    summary_filepath = os.path.join(root_dir, summary_filename)
+    summary_filepath = os.path.join(stock_data_dir, summary_filename)
+    if not os.path.exists(summary_filepath):
+        legacy_path = os.path.join(root_dir, summary_filename)
+        if os.path.exists(legacy_path):
+            summary_filepath = legacy_path
+
     kline_dir = os.path.join(root_dir, "kline_data")
     fast_mode = os.environ.get("FAST_MODE", "1") == "1"
 
     # 如果指定主题文件不存在，且没有特定主题，回退使用全市场总表
     if not os.path.exists(summary_filepath) and not topic_clean:
-        fallback_all = os.path.join(root_dir, "stock_kline_all.csv")
+        fallback_all = os.path.join(stock_data_dir, "stock_kline_all.csv")
+        if not os.path.exists(fallback_all):
+            fallback_all = os.path.join(root_dir, "stock_kline_all.csv")
         if os.path.exists(fallback_all):
             summary_filepath = fallback_all
 
@@ -627,11 +642,11 @@ def download_stock_day(topic: str = "", limit: int = 60) -> str:
     if not all_kline_dfs:
         return f"❌ 个股K线数据下载失败，未能从同花顺行情接口获取到任何个股K线。"
 
-    # 4. 合并生成总K线汇总 CSV 保存到根目录（存在相同文件则直接覆盖）
+    # 4. 合并生成总K线汇总 CSV 保存到 stock_data 目录（存在相同文件则直接覆盖）
     print("💾 正在整合生成全量日K线汇总 CSV...")
     combined_df = pd.concat(all_kline_dfs, ignore_index=True)
     summary_filename = f"{topic_clean}_kline_all.csv" if topic_clean else "stock_kline_all.csv"
-    summary_filepath = os.path.join(root_dir, summary_filename)
+    summary_filepath = os.path.join(stock_data_dir, summary_filename)
     combined_df.to_csv(summary_filepath, index=False, encoding="utf-8-sig")
 
     start_date = combined_df["交易日期"].min()
@@ -688,12 +703,17 @@ def filter_bullish_limit_up_stocks(topic: str = "", days: int = 10) -> str:
     """
     topic_clean = topic.strip() if topic else ""
     root_dir = get_project_root()
+    stock_data_dir = os.path.join(root_dir, "stock_data")
+    os.makedirs(stock_data_dir, exist_ok=True)
     kline_dir = os.path.join(root_dir, "kline_data")
 
-    # 1. 寻找数据源：优先读取合并大表，若无则遍历 kline_data/*.csv
-    target_summary_file = os.path.join(
-        root_dir, f"{topic_clean}_kline_all.csv" if topic_clean else "stock_kline_all.csv"
-    )
+    # 1. 寻找数据源：优先读取 stock_data 合并大表，若无则尝试根目录，最后遍历 kline_data/*.csv
+    target_summary_filename = f"{topic_clean}_kline_all.csv" if topic_clean else "stock_kline_all.csv"
+    target_summary_file = os.path.join(stock_data_dir, target_summary_filename)
+    if not os.path.exists(target_summary_file):
+        legacy_summary_file = os.path.join(root_dir, target_summary_filename)
+        if os.path.exists(legacy_summary_file):
+            target_summary_file = legacy_summary_file
 
     stock_dfs = []
     if os.path.exists(target_summary_file):
@@ -801,15 +821,15 @@ def filter_bullish_limit_up_stocks(topic: str = "", days: int = 10) -> str:
     # 按近 10 日涨停次数与累计涨跌幅双重降序排序
     matched_stocks.sort(key=lambda x: (x["近10日涨停次数"], x["近10日涨跌幅(%)"]), reverse=True)
 
-    # 2. 将过滤后的股票清单保存到 CSV 文件（存在相同的就直接覆盖）
+    # 2. 将过滤后的股票清单保存到 CSV 文件至 stock_data 目录（存在相同的就直接覆盖）
     filtered_df = pd.DataFrame(matched_stocks)
     filtered_filename = f"{topic_clean}_filtered_stocks.csv" if topic_clean else "filtered_stocks.csv"
-    filtered_filepath = os.path.join(root_dir, filtered_filename)
+    filtered_filepath = os.path.join(stock_data_dir, filtered_filename)
     filtered_df.to_csv(filtered_filepath, index=False, encoding="utf-8-sig")
 
-    # 3. 将筛选股票对应的完整 K 线时序数据合并保存（存在相同的就直接覆盖）
+    # 3. 将筛选股票对应的完整 K 线时序数据合并保存至 stock_data 目录（存在相同的就直接覆盖）
     filtered_kline_filename = f"{topic_clean}_filtered_kline_all.csv" if topic_clean else "filtered_kline_all.csv"
-    filtered_kline_filepath = os.path.join(root_dir, filtered_kline_filename)
+    filtered_kline_filepath = os.path.join(stock_data_dir, filtered_kline_filename)
     if matched_kline_dfs:
         combined_filtered_kline = pd.concat(matched_kline_dfs, ignore_index=True)
         combined_filtered_kline.to_csv(filtered_kline_filepath, index=False, encoding="utf-8-sig")
@@ -1040,7 +1060,9 @@ def monitor_stock_timeline(target: str = "") -> str:
                     stocks.append({"code": it, "name": it})
     else:
         # 留空或传入 auto：联动上一阶段筛选出的强势股票池
-        filtered_csv = os.path.join(root_dir, "filtered_stocks.csv")
+        filtered_csv = os.path.join(root_dir, "stock_data", "filtered_stocks.csv")
+        if not os.path.exists(filtered_csv):
+            filtered_csv = os.path.join(root_dir, "filtered_stocks.csv")
         if os.path.exists(filtered_csv):
             try:
                 fdf = pd.read_csv(filtered_csv, dtype={"股票代码": str})

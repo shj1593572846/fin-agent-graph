@@ -47,3 +47,4 @@ class ResearchState(TypedDict, total=False):
     # === node6 产出 ===
     final_decision: str               # 决策者 Agent 综合研判与终审操盘报告
     analysis_result: str              # 兼容原有字段 (指向最终分析报告)
+    top_stock: dict                   # 综合排名第一的龙头股票标的

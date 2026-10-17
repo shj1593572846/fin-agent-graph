@@ -12,8 +12,10 @@
 # 行情与分时下载缓存数据目录
 /kline_data/
 /timeline_data/
+/stock_data/
 kline_data/
 timeline_data/
+stock_data/
 
 # Python 缓存与编译产物
 __pycache__/

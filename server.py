@@ -32,6 +32,17 @@ class RunRequest(BaseModel):
     keep_alive: int = 0
 
 
+@app.on_event("startup")
+async def startup_event():
+    """服务启动时自动拉起常驻定时任务后台监听引擎"""
+    try:
+        from agent.scheduler import scheduler_instance
+        scheduler_instance.start()
+        print("⏰ [FastAPI Startup] 定时任务常驻调度引擎已成功启动就绪！")
+    except Exception as e:
+        print(f"⚠️ [FastAPI Startup] 启动定时任务调度引擎失败: {e}")
+
+
 @app.get("/api/health")
 async def health_check():
     is_running = current_process is not None and current_process.returncode is None
@@ -41,6 +52,119 @@ async def health_check():
         "python_version": sys.version.split()[0],
         "workdir": os.getcwd()
     }
+
+
+@app.get("/api/recommendations")
+async def get_recommendations(limit: int = 20):
+    """查询 MySQL stock_recommendation 表中的最新股票推荐入库记录"""
+    try:
+        from agent import db
+        records = db.get_latest_recommendations(limit=limit)
+        return {"success": True, "data": records, "count": len(records)}
+    except Exception as e:
+        return {"success": False, "error": str(e), "data": [], "count": 0}
+
+
+# ==============================================================================
+# 定时任务管理 RESTful API (配置：任务名称、运行的python文件、cron表达式)
+# ==============================================================================
+class TaskCreateRequest(BaseModel):
+    name: str
+    python_script: str = "agent/sync_close_price.py"
+    cron_expr: str = "10 15 * * 1-5"
+    enabled: bool = True
+
+
+class TaskUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    python_script: Optional[str] = None
+    cron_expr: Optional[str] = None
+    enabled: Optional[bool] = None
+
+
+@app.get("/api/tasks")
+async def get_tasks():
+    """获取所有定时任务列表"""
+    try:
+        from agent.scheduler import scheduler_instance
+        tasks = scheduler_instance.get_all_tasks()
+        return {"success": True, "data": tasks, "count": len(tasks)}
+    except Exception as e:
+        return {"success": False, "error": str(e), "data": [], "count": 0}
+
+
+@app.post("/api/tasks")
+async def create_task(req: TaskCreateRequest):
+    """新增定时任务 -> 写入存储并立刻动态注册生效"""
+    try:
+        from agent.scheduler import scheduler_instance
+        task = scheduler_instance.add_task(req.dict())
+        return {"success": True, "data": task, "message": f"定时任务【{task['name']}】已创建并立刻生效！"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.put("/api/tasks/{task_id}")
+async def update_task(task_id: int, req: TaskUpdateRequest):
+    """修改定时任务 -> 更新配置并立刻热重载生效"""
+    try:
+        from agent.scheduler import scheduler_instance
+        data = {k: v for k, v in req.dict().items() if v is not None}
+        task = scheduler_instance.update_task(task_id, data)
+        if not task:
+            return {"success": False, "message": f"任务 ID {task_id} 不存在"}
+        return {"success": True, "data": task, "message": f"定时任务【{task['name']}】已更新并立刻生效！"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.delete("/api/tasks/{task_id}")
+async def delete_task(task_id: int):
+    """删除定时任务 -> 从调度池卸载并立刻生效"""
+    try:
+        from agent.scheduler import scheduler_instance
+        ok = scheduler_instance.delete_task(task_id)
+        if not ok:
+            return {"success": False, "message": f"任务 ID {task_id} 不存在"}
+        return {"success": True, "message": "定时任务已成功删除并卸载生效！"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/tasks/{task_id}/toggle")
+async def toggle_task(task_id: int):
+    """启用/停用定时任务 -> 立刻生效"""
+    try:
+        from agent.scheduler import scheduler_instance
+        task = scheduler_instance.toggle_task(task_id)
+        if not task:
+            return {"success": False, "message": f"任务 ID {task_id} 不存在"}
+        status_text = "已启用" if task.get("enabled") else "已停用"
+        return {"success": True, "data": task, "message": f"任务【{task['name']}】{status_text}并立刻生效！"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/tasks/{task_id}/run")
+async def run_task_now(task_id: int):
+    """立即手动触发执行指定定时任务脚本"""
+    try:
+        from agent.scheduler import scheduler_instance
+        res = scheduler_instance.execute_task_now(task_id)
+        return res
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/api/tasks/sync-close-prices")
+async def trigger_sync_close_prices(target_date: Optional[str] = None):
+    """一键手动触发当日/指定日期的 A 股收盘价同步脚本"""
+    try:
+        from agent.sync_close_price import run_sync
+        ok = run_sync(target_date or "")
+        return {"success": ok, "message": "A股收盘价同步执行完成" if ok else "收盘价同步执行异常"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 @app.post("/api/stop")
@@ -184,4 +308,4 @@ async def websocket_run(websocket: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("server:app", host="127.0.0.1", port=8000, reload=False)
+    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)

@@ -80,10 +80,19 @@ def run_research_pipeline(topic: str, keep_alive_minutes: int = 10) -> str:
     print("=" * 80)
     decision = final_state.get("final_decision", final_state.get("analysis_result", ""))
     if not decision or not str(decision).strip():
-        decision = "⚠️ [系统提示] 未获取到有效终审研报内容，请检查大模型网络连通性或查看 qualified_stocks_morning.csv。"
+        decision = "⚠️ [系统提示] 未获取到有效终审研报内容，请检查大模型网络连通性或查看 stock_data/qualified_stocks_morning.csv。"
     print(decision)
     print("=" * 80 + "\n")
     sys.stdout.flush()
+
+    # 💾 【策略执行完毕】提取排名第一股票并持久化至 MySQL stock_recommendation 表（排重校验：股票代码 + 买入日期）
+    try:
+        from db import save_top_stock_from_state
+        save_top_stock_from_state(final_state)
+    except Exception as e:
+        print(f"⚠️ [数据库提示] 写入 stock_recommendation 表异常: {str(e)}\n")
+        sys.stdout.flush()
+
     # 延迟保持 16 宫格网页看板服务运行 (默认 10 分钟，支持 Ctrl+C 随时安全退出)
     if keep_alive_minutes > 0:
         dash_urls = final_state.get('dashboard_urls', [final_state.get('dashboard_url', 'http://127.0.0.1:8888')])
@@ -102,6 +111,9 @@ def run_research_pipeline(topic: str, keep_alive_minutes: int = 10) -> str:
         except KeyboardInterrupt:
             print("\n\n🛑 检测到中断信号，16宫格后台服务已安全退出。")
 
+    
+
+    
     return decision
 
 

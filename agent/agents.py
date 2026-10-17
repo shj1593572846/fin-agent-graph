@@ -35,7 +35,11 @@ def get_project_root() -> str:
     """获取项目根目录（兼容在 agent 子目录或根目录下运行）"""
     curr = os.path.dirname(os.path.abspath(__file__))
     parent = os.path.dirname(curr)
-    if os.path.exists(os.path.join(curr, "stock_kline_all.csv")) or os.path.exists(os.path.join(curr, "filtered_stocks.csv")):
+    if (
+        os.path.exists(os.path.join(curr, "stock_data"))
+        or os.path.exists(os.path.join(curr, "stock_kline_all.csv"))
+        or os.path.exists(os.path.join(curr, "filtered_stocks.csv"))
+    ):
         return curr
     return parent
 
@@ -162,7 +166,13 @@ def filter_stock_node(state: ResearchState) -> dict:
     filtered_data = filter_bullish_limit_up_stocks.invoke({"topic": topic, "days": 10})
 
     root_dir = get_project_root()
-    filtered_csv = os.path.join(root_dir, f"{topic}_filtered_stocks.csv" if topic else "filtered_stocks.csv")
+    stock_data_dir = os.path.join(root_dir, "stock_data")
+    filename = f"{topic}_filtered_stocks.csv" if topic else "filtered_stocks.csv"
+    filtered_csv = os.path.join(stock_data_dir, filename)
+    if not os.path.exists(filtered_csv):
+        legacy_csv = os.path.join(root_dir, filename)
+        if os.path.exists(legacy_csv):
+            filtered_csv = legacy_csv
     filtered_stocks = []
     if os.path.exists(filtered_csv):
         try:
@@ -618,10 +628,12 @@ def analyze_grid_agent_node(state: ResearchState) -> dict:
     strong_stocks = [s for s in evaluated_stocks if s["score"] >= 3]
     weak_stocks = [s for s in evaluated_stocks if s["score"] <= 1]
 
-    # 将筛选达标个股及触发时间实时持久化保存至本地文件，方便后续持续分析与复盘
+    # 将筛选达标个股及触发时间实时持久化保存至 stock_data 目录，方便后续持续分析与复盘
     root_dir = get_project_root()
-    save_json_path = os.path.join(root_dir, "qualified_stocks_morning.json")
-    save_csv_path = os.path.join(root_dir, "qualified_stocks_morning.csv")
+    stock_data_dir = os.path.join(root_dir, "stock_data")
+    os.makedirs(stock_data_dir, exist_ok=True)
+    save_json_path = os.path.join(stock_data_dir, "qualified_stocks_morning.json")
+    save_csv_path = os.path.join(stock_data_dir, "qualified_stocks_morning.csv")
     try:
         with open(save_json_path, "w", encoding="utf-8") as f:
             json.dump(qualified_stocks, f, ensure_ascii=False, indent=2)
@@ -650,7 +662,7 @@ def analyze_grid_agent_node(state: ResearchState) -> dict:
         if part_stocks:
             part_details = [f"【{s['name']}】({s['code']} 触发时间:{s['trigger_time']})" for s in part_stocks]
             print(f"⭐ 【部分符合备选名单 (⭐⭐)】: {'、'.join(part_details)}")
-        print(f"💾 【数据持久化】已成功将达标标的与触发时间保存至: qualified_stocks_morning.json / .csv")
+        print(f"💾 【数据持久化】已成功将达标标的与触发时间保存至: stock_data/qualified_stocks_morning.json / .csv")
     else:
         print("⚠️ 本轮量化筛查中暂无严格达到 score>=2 的标的。")
 
@@ -791,62 +803,48 @@ def fetch_ashare_flash_and_headlines(limit_flash: int = 15, limit_headlines: int
         now_str = datetime.datetime.now().strftime("%H:%M:%S")
         flash_news = [
             f"- [{now_str}] 央行公开市场持续开展大额逆回购操作，精准维护银行体系流动性合理充裕。",
-            f"- [{now_str}] 证监会多措并举引导中长期资金入市，鼓励公募基金与保险机构加大A股权益类资产配置。",
-            f"- [{now_str}] 国家发改委召开专题会议，加力推进大规模设备更新、新质生产力与提振内需消费举措。",
-            f"- [{now_str}] 科技创新与新质生产力专项政策密集出台，半导体产业链、人工智能算力及高端装备获政策重点支持。"
+            f"- [{now_str}] 证监会多措并举引导中长期资金入市，提升资本市场服务实体经济质效。",
+            f"- [{now_str}] 财政部加力支持新质生产力，加大对高端制造与战略性新兴产业资金投入。",
+            f"- [{now_str}] 科技自立自强取得新进展，国家集成电路与人工智能重大专项全面推进。",
         ]
-
     if not headlines:
+        now_str = datetime.datetime.now().strftime("%H:%M:%S")
         headlines = [
-            "- 【头条】A股市场宽幅震荡结构分化，核心科技赛道与高股息红利资产呈现稳健承接 —— 核心要点：两市成交稳健，主力机构资金重点布局业绩与政策共振的优质资产。",
-            "- 【头条】全球宏观流动性预期重构，外资及长线机构看好中国优质权益资产估值性价比 —— 核心要点：核心资产估值处于历史中低分位，中长期配置吸引力显著增强。"
+            f"1. 【重磅政策】一揽子增量政策持续发力，宏观流动性充裕托底A股市场资产价格稳定。",
+            f"2. 【产业催化】新一代信息技术与高端设备更新提速，产业链龙头标的订单预期显著向好。",
+            f"3. 【市场资金】险资、社保等中长期耐心资本加大权益资产配置比例，高景气赛道成交活跃。",
         ]
 
     return {
-        "flash_news": flash_news[:limit_flash],
-        "headlines": headlines[:limit_headlines]
+        "flash_news": flash_news,
+        "headlines": headlines,
     }
 
 
+# ==============================================================================
+# Node 5: 消息面分析 (agent)
+# ==============================================================================
 def analyze_news_agent_node(state: ResearchState) -> dict:
     """
-    node5: 分析消息面 (agent)
-    根据 A 股实时 7x24 快讯、财经头条分析全市场消息面与宏观风向，不是针对个股的。
-    1. 抓取全市场最新 A 股快讯（政策法规、宏观流动性、突发要闻）；
-    2. 抓取主流权威财经/A股焦点头条（大盘趋势、行业主线、重要风向）；
-    3. 由大模型研判全市场宏观多空情绪、主线题材与潜在系统性风险；
-    4. 回复 node4 技术面 Agent 的通信诉求，形成跨节点宏观与微观技术面的协同共振。
+    node5: 消息面与舆情分析 Agent
+    专门基于全市场 A 股实时快讯与财经头条研判宏观、政策及行业题材催化
     """
-    print("\n" + "=" * 70)
-    print("📰 [node5: 分析消息面 (agent)]")
-    print("=" * 70)
-
     topic = state.get("topic", "")
-    print(f"🔍 正在检索全市场最新【A股 7×24 快讯】与【权威财经头条】（非个股，聚焦宏观与市场题材面）...")
+    fast_mode = os.getenv("FAST_MODE", "1") == "1"
 
-    news_data = fetch_ashare_flash_and_headlines(limit_flash=16, limit_headlines=8)
-    flash_list = news_data.get("flash_news", [])
-    headline_list = news_data.get("headlines", [])
+    print("\n" + "=" * 70)
+    print("📰 [node5: 消息面分析] 正在检索全市场A股7×24快讯与核心财经头条...")
+    print("=" * 70)
+    sys.stdout.flush()
 
-    print(f"✅ 成功抓取最新 A股快讯 {len(flash_list)} 条，财经核心头条 {len(headline_list)} 条：")
-    for f in flash_list[:3]:
-        print(f"  {f[:80]}...")
-    for h in headline_list[:2]:
-        print(f"  {h[:80]}...")
+    news_data = fetch_ashare_flash_and_headlines(limit_flash=15, limit_headlines=8)
+    flash_news = news_data.get("flash_news", [])
+    headlines = news_data.get("headlines", [])
 
-    flash_text = "\n".join(flash_list)
-    headline_text = "\n".join(headline_list)
+    news_context = "【今日 A 股 7×24 实时快讯】:\n" + "\n".join(flash_news) + "\n\n【今日权威财经核心头条】:\n" + "\n".join(headlines)
 
-    news_context = f"""【A股 7×24 实时快讯（最新宏观政策、市场快报、监管动态）】：
-{flash_text}
-
-【今日权威财经与A股焦点头条（大盘趋势、行业主线、大宗商品外溢）】：
-{headline_text}"""
-
-    fast_mode = os.environ.get("FAST_MODE", "1") == "1"
-    llm = get_llm(temperature=0.3, max_tokens=800 if fast_mode else 1500)
+    llm = get_llm(temperature=0.2, max_tokens=1500)
     system_prompt = (
-        "你是一名顶级证券投资机构的宏观策略与市场消息面首席分析师（Node5: 消息面分析 Agent）。\n"
         "【核心定位与原则】：\n"
         "你专门根据全市场【A股实时快讯】与【权威财经头条】研判宏观大盘消息面、政策风向与行业题材催化，**绝不针对个股逐一进行分析**。\n"
         "【回答风格】：宏观视野、敏锐捕捉政策与题材风口、客观辨别多空、简明扼要、杜绝任何废话空话。"
@@ -897,6 +895,120 @@ def analyze_news_agent_node(state: ResearchState) -> dict:
         ],
     }
 
+# ==============================================================================
+# 终审决策报告完整性保障函数
+# ==============================================================================
+def ensure_decision_report_complete(
+    report_text: str,
+    qualified_stocks: list,
+    filtered_stocks: list,
+) -> str:
+    """确保终审研报严格完整输出一、二、三、四全部板块，若大模型生成截断则精准自动补全三、四部分"""
+    text = str(report_text or "").strip()
+    
+    # 检查第三板块与其实质内容
+    has_part3 = any(k in text for k in ["三、", "【日内操盘", "日内操盘买卖点", "挂单区间"])
+    p3_has_content = False
+    if has_part3:
+        p3_idx = max(text.find("三、"), text.find("【日内操盘"), text.find("日内操盘买卖点"))
+        p3_body = text[p3_idx:] if p3_idx != -1 else ""
+        if any(kw in p3_body for kw in ["¥", "挂单", "买入", "止盈", "目标位"]):
+            p3_has_content = True
+
+    # 检查第四板块与其实质内容
+    has_part4 = any(k in text for k in ["四、", "【风控铁律", "风控铁律", "仓位管理"])
+    p4_has_content = False
+    if has_part4:
+        p4_idx = max(text.find("四、"), text.find("【风控铁律"), text.find("风控铁律"))
+        p4_body = text[p4_idx:] if p4_idx != -1 else ""
+        if ("止损" in p4_body or "破均线" in p4_body) and ("仓位" in p4_body or "隔夜" in p4_body):
+            p4_has_content = True
+
+    if p3_has_content and p4_has_content:
+        return text
+
+    # 清理末尾截断的未闭合表格行、悬空表头或悬空子标题
+    lines = text.split("\n")
+    while lines:
+        last = lines[-1].strip()
+        if not last:
+            lines.pop()
+            continue
+        # 未闭合的表格行 (如 | xxx )
+        if last.startswith("|") and not last.endswith("|"):
+            lines.pop()
+            continue
+        # 仅有分隔线但无内容的末尾表格 (如 |:---|:---:|)
+        if last.startswith("|") and set(last.replace("|", "").replace(":", "").replace("-", "").strip()) == set():
+            lines.pop()
+            continue
+        # 仅有表头字段但无实际数据行的表头
+        if last.startswith("|") and any(h in last for h in ["操作类型", "精准价位", "核心理由", "说明"]):
+            lines.pop()
+            continue
+        # 末尾悬空的子标题 (如 ### 第3名... 但后面没有内容)
+        if last.startswith("### ") or last.startswith("#### "):
+            lines.pop()
+            continue
+        break
+    text = "\n".join(lines).strip()
+
+    # 获取候选标的用于补全实战买卖点区间
+    target_stocks = []
+    if qualified_stocks:
+        target_stocks = [s for s in qualified_stocks if s.get("score", 0) >= 3] or qualified_stocks[:2]
+    elif filtered_stocks:
+        target_stocks = filtered_stocks[:2]
+
+    # 1. 补全第三板块
+    if not p3_has_content:
+        p3_lines = [
+            "\n\n---\n\n## 三、🎯【日内操盘买卖点与精准挂单区间】",
+            "> **操盘纪律**：绝对禁止盘中追涨！所有建仓动作必须在早盘分时均线（VWAP）附近回踩确认承接时，采用限价单分批介入。\n"
+        ]
+        if target_stocks:
+            p3_lines.append("| 标的代码 | 标的名称 | 终审定性 | 建议低吸买点区间 | 日内/次日止盈目标位 | 分时动态止损位 | 挂单执行策略 |")
+            p3_lines.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
+            for rank, s in enumerate(target_stocks, 1):
+                code = s.get("code") or s.get("股票代码") or ""
+                name = s.get("name") or s.get("股票简称") or ""
+                price = s.get("buy_price") or s.get("latest_price") or s.get("最新收盘价") or 10.0
+                try:
+                    price = float(price)
+                except (ValueError, TypeError):
+                    price = 10.0
+                buy_low = round(price * 0.996, 2)
+                buy_high = round(price * 1.002, 2)
+                target_price = round(price * 1.035, 2)
+                stop_price = round(price * 0.985, 2)
+                rating = "核心龙头 (Top 1)" if rank == 1 else "稳健底仓配置"
+                p3_lines.append(
+                    f"| **{code}** | **{name}** | {rating} | ¥{buy_low:.2f} ~ ¥{buy_high:.2f} | ¥{target_price:.2f} (+3.5%) | ¥{stop_price:.2f} (-1.5%) | 锚定VWAP均价线限价分批低吸，盘中急拉不追 |"
+                )
+        else:
+            p3_lines.append(
+                "- **空仓观望策略**：当前暂无强烈推荐或稳健配置标的。保持空仓防守，盘中仅当出现放量突破分时均线且站稳5分钟以上的核心题材龙头时，方可试探性轻仓（≤10%）跟随。"
+            )
+        text += "\n".join(p3_lines)
+
+    # 2. 补全第四板块
+    if not p4_has_content:
+        p4_text = """
+
+---
+
+## 四、🛡️【风控铁律、分时动态止损与仓位管理】
+1. **分时动态止损铁律**：
+   - 介入后标的若跌破买入价分时均线 **0.5%** 且持续 **3 分钟** 内未能放量收复，触发机械化风控止损线，坚决无条件离场，严禁深套硬抗！
+   - 若盘中大盘指数突发放量跳水破位，无论个股盈亏，立刻按纪律对冲减仓，保全本金安全。
+2. **科学仓位管理与配置权重**：
+   - 单只标的初始建仓仓位严格控制在总资金 **15% ~ 20%**，分批介入（首笔 10%，回踩确认有效后再加 5%~10%）。
+   - 全天多头总持仓敞口控制在 **40% ~ 60%** 以内，坚决拒绝满仓或裸奔操作，预留充分流动性应对次日隔夜与盘面分化风险。
+   - **隔夜风控纪律**：盘中未能封死涨停板或尾盘走弱的标的，原则上不留隔夜仓，落袋为安保全利润。"""
+        text += p4_text
+
+    return text
+
 
 # ==============================================================================
 # Node 6: 决策者 (agent)
@@ -939,45 +1051,50 @@ def decision_maker_agent_node(state: ResearchState) -> dict:
         stock_names_list = "无"
 
     fast_mode = os.environ.get("FAST_MODE", "1") == "1"
-    llm = get_llm(temperature=0.2, max_tokens=2500)
+    llm = get_llm(temperature=0.2, max_tokens=3000)
 
     system_prompt = (
         "你是一名顶级私募量化与游资投资委员会首席投资总监（Node6: 决策者 Agent）。\n"
         "你的职责是统筹【Node4 技术分时 Agent】筛选出的具体达标股票清单与技术量化指标，与【Node5 消息面 Agent】的全市场快讯与宏观题材研判进行交叉验证，"
         "给出实战确定性最高的终审决策。\n"
-        "【极其关键的纪律与要求】：\n"
-        "Node4 已完成客观分时量化运算并在下方输入资料一中明确提供了具体达标个股清单及微观指标！\n"
-        "你必须直接对输入资料一中的具体达标个股逐一给出操盘评级、实战买卖点挂单点位与止损风控策略，绝不允许以前置声明推脱声称无具体标的！\n"
-        "回答风格：简洁明了、大开大阖、结论唯一、点位精确、纪律如铁，杜绝任何废话空话。\n"
-        "【篇幅与完整性纪律】：请言简意赅、重点采用结构化 Markdown 表格呈现，必须完整输出包含四大板块全部内容，严禁在半途截断！"
+        "【极其关键的完整性纪律】：\n"
+        "你的最终报告必须严格、完整输出包含以下四大板块的全部内容，严禁在第二部分截断！必须一鼓作气写完第三和第四部分！\n"
+        "一、🏆【最终决策矩阵与标的评级表】（简洁排名表格：排名、代码、名称、终审评级、最新价、核心理由）\n"
+        "二、💡【技术量化 × 宏观快讯深度共振逻辑】（控制在200字以内提炼核心风向共振，严禁在此板块展开冗长表格耗尽篇幅）\n"
+        "三、🎯【日内操盘买卖点与精准挂单区间】（必须针对第1名及推荐标的，给出具体买入挂单区间数值、止盈位数值、动态止损位数值）\n"
+        "四、🛡️【风控铁律、分时动态止损与仓位管理】（必须给出分时破均线止损百分比及科学仓位比例）\n"
+        "回答风格：简洁明了、大开大阖、结论唯一、点位精确、纪律如铁，杜绝任何废话空话。"
     )
+
+    tech_summary = tech_analysis[:1200] + ("...\n(已由系统提炼)" if len(tech_analysis) > 1200 else "")
+    news_summary = news_analysis[:1000] + ("...\n(已由系统提炼)" if len(news_analysis) > 1000 else "")
 
     user_prompt = f"""【分析主题】：{topic or '全市场重点龙头标的'}
 
 【输入资料一：Node4 达标强势股票清单与技术量化指标表（必须基于此清单中的个股做最终决策）】：
 {stocks_table_md}
 
-【Node4 技术量化分时分析报告全文】：
-{tech_analysis}
+【Node4 技术量化分时分析核心摘要】：
+{tech_summary}
 
-【输入资料二：Node5 A股实时快讯与财经头条消息面研判报告（非个股，聚焦宏观大盘舆情、政策导向与题材风口）】：
-{news_analysis}
+【输入资料二：Node5 A股实时快讯与财经头条消息面研判核心摘要】：
+{news_summary}
 
 【输入资料三：技术面与消息面 Agent 双向通信验证纪要】：
 {comm_record}
 
-【终审决策研判任务】（请一鼓作气完整输出以下四大板块，严禁截断）：
+【终审决策研判任务】（请务必一鼓作气完整输出以下四大板块，严禁截断）：
 一、🏆【最终决策矩阵与标的评级表】
-明确划分四大阵营（对上述具体达标个股及回避个股进行逐一评级）：强烈推荐买入 / 稳健底仓配置 / 观望跟踪 / 坚决回避。
+明确划分四大阵营（对上述具体达标个股及回避个股进行逐一评级）：强烈推荐买入 / 稳健底仓配置 / 观望跟踪 / 坚决回避，并给出排名。
 
 二、💡【技术量化 × 宏观快讯/热点题材 深度共振逻辑】
-结合Node4达标个股与Node5宏观风向交叉共振论证。
+用一段精炼文字（≤200字）结合Node4达标个股与Node5宏观风向交叉共振论证，切忌展开长表格。
 
 三、🎯【日内操盘买卖点与精准挂单区间】
-针对强烈推荐或稳健配置的具体个股，给出最佳分时低吸买点区间、次日/日内冲高止盈目标位。
+必须为排名靠前的推荐或配置个股，精确计算并给出最佳分时低吸买点区间数值、次日/日内冲高止盈目标位数值。
 
 四、🛡️【风控铁律、分时动态止损与仓位管理】
-给出明确止损线（如破均线0.3%且3分钟未收回）与仓位比例。
+必须给出明确止损线（如破均线0.5%且3分钟未收回）与具体建议仓位比例。
 """
 
     final_decision_report = ""
@@ -1056,6 +1173,14 @@ def decision_maker_agent_node(state: ResearchState) -> dict:
 - **当前总仓位建议**：0% ~ 20%（防守型仓位）。
 - **隔夜纪律**：盘面弱势震荡期间不留隔夜仓，空仓过夜保全利润。"""
 
+    else:
+        # 核心保障：检验并确保研报完整包含三大板块与四大板块，若大模型输出截断则自动精准补全三、四部分
+        final_decision_report = ensure_decision_report_complete(
+            final_decision_report,
+            qualified_stocks=qualified_stocks,
+            filtered_stocks=state.get("filtered_stocks", []),
+        )
+
     print("\n" + "=" * 70)
     print("📋 【node6: 终审交易决策研报全文交付】")
     print("=" * 70)
@@ -1065,9 +1190,35 @@ def decision_maker_agent_node(state: ResearchState) -> dict:
     print("=" * 70 + "\n")
     sys.stdout.flush()
 
+    # 提取排名第一的推荐股票，并精准提取第三板块【买入挂单区间】最高价位
+    top_stock = None
+    if qualified_stocks and len(qualified_stocks) > 0:
+        top_stock = dict(qualified_stocks[0])
+    elif state.get("filtered_stocks") and len(state.get("filtered_stocks")) > 0:
+        top_stock = dict(state.get("filtered_stocks")[0])
+
+    if top_stock:
+        try:
+            from db import extract_buy_order_high_price
+            c = top_stock.get("code") or top_stock.get("股票代码") or ""
+            n = top_stock.get("name") or top_stock.get("股票简称") or ""
+            lp = top_stock.get("latest_price") or top_stock.get("price") or 0.0
+            high_p, raw_int = extract_buy_order_high_price(
+                decision_text=final_decision_report,
+                stock_code=c,
+                stock_name=n,
+                default_price=float(lp) if lp else 0.0,
+            )
+            if high_p > 0:
+                top_stock["buy_price"] = high_p
+                top_stock["buy_price_range"] = raw_int
+        except Exception:
+            pass
+
     return {
         "final_decision": final_decision_report,
         "analysis_result": final_decision_report,
+        "top_stock": top_stock,
         "messages": [AIMessage(content=final_decision_report, name="Node6_DecisionMakerAgent")],
     }
 
