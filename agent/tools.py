@@ -1150,11 +1150,45 @@ def monitor_stock_timeline(target: str = "") -> str:
     return "\n".join(summary_lines)
 
 
+@tool
+def query_financial_rag_knowledge(query: str, category: str = "", stock_code: str = "") -> str:
+    """
+    检索本地研报分析与财报解读 RAG 知识库。
+    当需要查询个股深度券商研报、机构投资评级、目标价、业绩催化剂，或解读企业季报/年报财务指标（营收、净利润、毛利率、现金流等）时调用此工具。
+    参数:
+    - query: 查询问题或关键词（如'贵州茅台一季度净利润增速与毛利率'、'宁德时代核心投资逻辑'）
+    - category: 可选分类过滤，'研报分析' 或 '财报解读'，留空则不限分类
+    - stock_code: 可选股票代码（如 '600519'），留空则全局语义匹配
+    """
+    try:
+        from rag.rag_service import rag_service
+        cat = category if category in ["研报分析", "财报解读"] else None
+        res = rag_service.query_rag(
+            query=query,
+            category=cat,
+            stock_code=stock_code,
+            top_k=3,
+            generate_answer=False,
+        )
+        sources = res.get("sources", [])
+        if not sources:
+            return f"在 RAG 知识库中未检索到与「{query}」相关的研报或财报切片。"
+
+        output = [f"=== 本地研报与财报 RAG 知识库检索结果（共匹配到 {len(sources)} 条高相关知识切片）==="]
+        for idx, s in enumerate(sources):
+            output.append(f"\n【切片 {idx+1}】《{s.get('title')}》 ({s.get('category')} | 标的: {s.get('stock_code')} {s.get('stock_name')}) [相似度: {int(s.get('score', 0)*100)}%]")
+            output.append(s.get("text", ""))
+        return "\n".join(output)
+    except Exception as e:
+        return f"查询 RAG 知识库异常: {str(e)}"
+
+
 COLLECTOR_TOOLS = [
     search_web_data,
     search_academic_papers,
     download_stock_day,
     filter_bullish_limit_up_stocks,
     monitor_stock_timeline,
+    query_financial_rag_knowledge,
 ]
 

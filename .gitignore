@@ -36,3 +36,8 @@ frontend/dist/
 *.log
 npm-debug.log*
 yarn-debug.log*
+
+# RAG 向量持久化数据库与用户上传文档暂存
+rag/data/chroma_db/
+rag/data/documents/
+rag/samples/

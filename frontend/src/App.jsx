@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react'
+import RagKnowledgeView from './RagKnowledgeView'
 import './App.css'
 
 const PRESET_TOPICS = [
@@ -43,9 +44,12 @@ export default function App() {
   const [recommendations, setRecommendations] = useState([])
   const [showRecModal, setShowRecModal] = useState(false)
 
+  // 首页一级菜单导航: 'stock_selection' (量化选股) | 'task_management' (定时任务管理) | 'rag_knowledge' (研报财报知识库)
+  const [activeMenu, setActiveMenu] = useState('stock_selection')
+  const [ragDocCount, setRagDocCount] = useState(0)
+
   // 定时任务调度管理状态
   const [tasks, setTasks] = useState([])
-  const [showTaskModal, setShowTaskModal] = useState(false)
   const [showEditTaskModal, setShowEditTaskModal] = useState(false)
   const [editingTask, setEditingTask] = useState(null)
   const [taskRunningId, setTaskRunningId] = useState(null)
@@ -69,7 +73,7 @@ export default function App() {
 
   // 通用后端 API 地址计算
   const getApiUrl = (endpoint) => {
-    if (window.location.port === '5173') {
+    if (window.location.port !== '8000') {
       const hostname = window.location.hostname === 'localhost' ? '127.0.0.1' : (window.location.hostname || '127.0.0.1')
       return `http://${hostname}:8000${endpoint}`
     }
@@ -103,6 +107,21 @@ export default function App() {
       }
     } catch (e) {
       console.warn('Failed to fetch tasks:', e)
+    }
+  }
+
+  // 拉取 RAG 知识库文档总数
+  const fetchRagDocCount = async () => {
+    try {
+      const res = await fetch(getApiUrl('/api/rag/stats'))
+      if (res.ok) {
+        const json = await res.json()
+        if (json.success && json.data) {
+          setRagDocCount(json.data.total_docs || 0)
+        }
+      }
+    } catch (e) {
+      // 容错忽略
     }
   }
 
@@ -240,6 +259,46 @@ export default function App() {
     }
   }
 
+  const handleDirectMonitorBreakPrices = async (force = false) => {
+    showToast('🔍 正在研判开市日次日分时均线跌破状态...')
+    try {
+      const res = await fetch(getApiUrl('/api/tasks/monitor-break-prices'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ force })
+      })
+      const json = await res.json()
+      if (json.success) {
+        showToast(`✅ ${json.message}`)
+        fetchRecommendations()
+        fetchTasks()
+      } else {
+        showToast(`⚠️ ${json.message || json.error}`)
+      }
+    } catch (err) {
+      showToast(`❌ 次日监控触发异常: ${err.message}`)
+    }
+  }
+
+  const handleToggleMonitor = async (recId, nextStatus) => {
+    try {
+      const res = await fetch(getApiUrl(`/api/recommendations/${recId}/monitor`), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ is_monitored: nextStatus })
+      })
+      const json = await res.json()
+      if (json.success) {
+        showToast(nextStatus ? '✅ 标的已恢复监控' : '⏸️ 标的已停止监控')
+        fetchRecommendations()
+      } else {
+        showToast(`❌ 更新监控状态失败: ${json.error || json.message}`)
+      }
+    } catch (e) {
+      showToast(`❌ 网络异常: ${e.message}`)
+    }
+  }
+
   // 显示吐司提示
   const showToast = (msg) => {
     setToast(msg)
@@ -268,9 +327,11 @@ export default function App() {
     checkServer()
     fetchRecommendations()
     fetchTasks()
+    fetchRagDocCount()
     const interval = setInterval(() => {
       checkServer()
       fetchTasks()
+      fetchRagDocCount()
     }, 5000)
     return () => clearInterval(interval)
   }, [status])
@@ -657,6 +718,49 @@ export default function App() {
           </div>
         </div>
 
+        {/* 首页一级导航菜单：量化选股 / 定时任务管理 */}
+        <nav className="header-nav-menu">
+          <button
+            type="button"
+            className={`nav-menu-item ${activeMenu === 'stock_selection' ? 'active' : ''}`}
+            onClick={() => setActiveMenu('stock_selection')}
+          >
+            <span className="nav-icon">🎯</span>
+            <span className="nav-label">量化选股</span>
+            {status === 'running' && <span className="nav-pulse-badge">运行中</span>}
+          </button>
+
+          <button
+            type="button"
+            className={`nav-menu-item ${activeMenu === 'task_management' ? 'active' : ''}`}
+            onClick={() => {
+              setActiveMenu('task_management')
+              fetchTasks()
+            }}
+          >
+            <span className="nav-icon">⏰</span>
+            <span className="nav-label">定时任务管理</span>
+            <span className="task-count-chip">
+              {tasks.filter((t) => t.enabled).length} 活跃
+            </span>
+          </button>
+
+          <button
+            type="button"
+            className={`nav-menu-item ${activeMenu === 'rag_knowledge' ? 'active' : ''}`}
+            onClick={() => {
+              setActiveMenu('rag_knowledge')
+              fetchRagDocCount()
+            }}
+          >
+            <span className="nav-icon">📚</span>
+            <span className="nav-label">研报财报知识库</span>
+            <span className="task-count-chip rag-chip">
+              {ragDocCount} 篇文档
+            </span>
+          </button>
+        </nav>
+
         <div className="header-status-group">
           <div className={`status-chip ${serverOnline ? 'online' : 'offline'}`}>
             <span className="status-dot"></span>
@@ -665,22 +769,12 @@ export default function App() {
           <div className="status-chip time-chip">
             <span>📅 {new Date().toLocaleDateString('zh-CN')}</span>
           </div>
-          <button
-            type="button"
-            className="btn-header-task"
-            onClick={() => {
-              setShowTaskModal(true)
-              fetchTasks()
-            }}
-            title="打开定时任务调度中心 (支持增删改查、热更新即刻生效)"
-          >
-            <span>⏰ 定时任务调度</span>
-            <span className="task-count-chip">
-              {tasks.filter((t) => t.enabled).length} 活跃
-            </span>
-          </button>
         </div>
       </header>
+
+      {/* 🎯 量化选股 主页面内容 */}
+      {activeMenu === 'stock_selection' && (
+        <>
 
       {/* 六节点拓扑流水线卡片 (点击可快速切换至该节点日志) */}
       <section className="pipeline-card">
@@ -864,6 +958,14 @@ export default function App() {
                 <span className="rec-chip name">股票名称: <strong>{recommendations[0].stock_name}</strong></span>
                 <span className="rec-chip price">买入价格: <strong>¥{Number(recommendations[0].buy_price || 0).toFixed(2)}</strong></span>
                 <span className="rec-chip date">买入日期: <strong>{recommendations[0].buy_date}</strong></span>
+                <span className={`rec-chip monitor ${recommendations[0].is_monitored !== 0 ? 'active' : 'inactive'}`}>
+                  是否监控: <strong>{recommendations[0].is_monitored !== 0 ? '🟢 监控中' : '⚪ 已停止'}</strong>
+                </span>
+                {recommendations[0].next_day_break_price !== null && recommendations[0].next_day_break_price !== undefined && (
+                  <span className={`rec-chip break-price ${recommendations[0].is_recommend_success ? 'profit' : 'loss'}`}>
+                    次日跌破卖出: <strong>¥{Number(recommendations[0].next_day_break_price).toFixed(2)}</strong> ({recommendations[0].is_recommend_success ? '盈利' : '止损'})
+                  </span>
+                )}
                 <span className="rec-chip time">创建时间: <strong>{recommendations[0].created_at}</strong></span>
               </div>
             </div>
@@ -871,11 +973,19 @@ export default function App() {
           <div className="rec-banner-actions">
             <button
               type="button"
+              className="btn-monitor-break-direct"
+              onClick={() => handleDirectMonitorBreakPrices(false)}
+              title="立即执行开市日次日分时跌破均线卖出量化研判"
+            >
+              <span>⚡ 次日跌破均线监控</span>
+            </button>
+            <button
+              type="button"
               className="btn-sync-close-direct"
               onClick={handleDirectSyncClosePrices}
               title="立即查询今日推荐标的并拉取行情回写收盘价"
             >
-              <span>⚡ 立即同步收盘价</span>
+              <span>📊 同步收盘价</span>
             </button>
             <button
               type="button"
@@ -889,12 +999,12 @@ export default function App() {
               type="button"
               className="btn-open-task-modal"
               onClick={() => {
-                setShowTaskModal(true)
+                setActiveMenu('task_management')
                 fetchTasks()
               }}
-              title="定时任务调度管理中心"
+              title="切换至定时任务管理中心"
             >
-              <span>⏰ 定时任务 ({tasks.length})</span>
+              <span>⏰ 定时任务管理 ({tasks.length})</span>
             </button>
           </div>
         </div>
@@ -1083,6 +1193,247 @@ export default function App() {
           </div>
         </div>
       </section>
+      </>
+      )}
+
+      {/* ⏰ 定时任务管理 主页面内容 */}
+      {activeMenu === 'task_management' && (
+        <section className="task-page-view">
+          <div className="task-page-header">
+            <div className="task-page-title-box">
+              <div className="task-page-badge">⏰ 自动化调度引擎</div>
+              <h2>系统定时任务调度管理中心</h2>
+              <p className="task-page-subtitle">
+                基于高可用动态调度架构，支持对 A 股定时任务动态增删改查、秒级热重载生效，开市日自动全流程监控
+              </p>
+            </div>
+            <div className="task-page-actions">
+              <button
+                type="button"
+                className="btn-create-task"
+                onClick={handleOpenCreateTask}
+                title="新建定时任务"
+              >
+                <span>➕ 新增定时任务</span>
+              </button>
+              <button
+                type="button"
+                className="btn-sync-now-head"
+                onClick={() => handleDirectMonitorBreakPrices(false)}
+                title="立即研判次日开市个股分时跌破均线卖出状态"
+              >
+                <span>⚡ 执行次日跌破监控</span>
+              </button>
+              <button
+                type="button"
+                className="btn-sync-close-direct"
+                onClick={handleDirectSyncClosePrices}
+                title="一键拉取今日推荐标的并回写收盘价"
+              >
+                <span>📊 同步收盘价</span>
+              </button>
+              <button
+                type="button"
+                className="btn-refresh-tasks"
+                onClick={fetchTasks}
+                title="刷新任务列表"
+              >
+                <span>🔄 刷新列表</span>
+              </button>
+            </div>
+          </div>
+
+          {/* 状态统计卡片指标栏 */}
+          <div className="task-stats-grid">
+            <div className="task-stat-card">
+              <div className="stat-icon-wrap cyan">📋</div>
+              <div className="stat-content">
+                <span className="stat-label">配置任务总数</span>
+                <span className="stat-value">{tasks.length} <small>个</small></span>
+              </div>
+            </div>
+            <div className="task-stat-card">
+              <div className="stat-icon-wrap green">🟢</div>
+              <div className="stat-content">
+                <span className="stat-label">运行中任务</span>
+                <span className="stat-value text-green">
+                  {tasks.filter((t) => t.enabled).length} <small>个</small>
+                </span>
+              </div>
+            </div>
+            <div className="task-stat-card">
+              <div className="stat-icon-wrap amber">⏸️</div>
+              <div className="stat-content">
+                <span className="stat-label">已暂停任务</span>
+                <span className="stat-value text-amber">
+                  {tasks.filter((t) => !t.enabled).length} <small>个</small>
+                </span>
+              </div>
+            </div>
+            <div className="task-stat-card">
+              <div className="stat-icon-wrap purple">📅</div>
+              <div className="stat-content">
+                <span className="stat-label">今日交易状态</span>
+                <span className="stat-value text-purple">
+                  {new Date().getDay() === 0 || new Date().getDay() === 6 ? '周末休市中' : 'A股开市交易日'}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          {/* 任务卡片列表 */}
+          <div className="task-page-body">
+            {tasks.length === 0 ? (
+              <div className="task-empty-state">
+                <div className="task-empty-icon">📭</div>
+                <div className="task-empty-title">暂无定时任务</div>
+                <p>点击上方“➕ 新增定时任务”即可创建自动任务，保存后立刻生效。</p>
+                <button
+                  type="button"
+                  className="btn-create-task"
+                  onClick={handleOpenCreateTask}
+                >
+                  ➕ 立即创建任务
+                </button>
+              </div>
+            ) : (
+              <div className="task-cards-list">
+                {tasks.map((t) => (
+                  <div
+                    key={t.id}
+                    className={`task-item-card ${t.enabled ? 'is-enabled' : 'is-disabled'}`}
+                  >
+                    <div className="task-card-main">
+                      <div className="task-card-header">
+                        <div className="task-card-title-wrap">
+                          <span className="task-id-badge">#{t.id}</span>
+                          <h4 className="task-card-name">{t.name}</h4>
+                          <span
+                            className="task-script-badge"
+                            title={`运行脚本文件: ${t.python_script || 'agent/sync_close_price.py'}`}
+                          >
+                            🐍 {t.python_script || 'agent/sync_close_price.py'}
+                          </span>
+                        </div>
+
+                        <div className="task-switch-container">
+                          <label
+                            className="task-toggle-switch"
+                            title={t.enabled ? '点击停用' : '点击启用'}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={t.enabled}
+                              onChange={() => handleToggleTask(t.id)}
+                            />
+                            <span className="task-slider"></span>
+                          </label>
+                          <span
+                            className={`task-switch-label ${
+                              t.enabled ? 'enabled' : 'disabled'
+                            }`}
+                          >
+                            {t.enabled ? '运行中' : '已暂停'}
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="task-meta-grid">
+                        <div className="task-meta-item">
+                          <span className="meta-label">⏰ cron表达式:</span>
+                          <span className="meta-val cron-val">{t.cron_expr}</span>
+                        </div>
+
+                        <div className="task-meta-item">
+                          <span className="meta-label">⏳ 下次触发:</span>
+                          <span className="meta-val next-val">
+                            {t.enabled
+                              ? t.next_run_time || '计算中...'
+                              : '— (任务已暂停)'}
+                          </span>
+                        </div>
+
+                        <div className="task-meta-item">
+                          <span className="meta-label">⏱️ 上次运行:</span>
+                          <span className="meta-val last-val">
+                            {t.last_run_time ? (
+                              <>
+                                <span>{t.last_run_time}</span>
+                                <span
+                                  className={`task-status-pill ${
+                                    t.last_status === 'success'
+                                      ? 'status-success'
+                                      : t.last_status === 'running'
+                                      ? 'status-running'
+                                      : 'status-error'
+                                  }`}
+                                >
+                                  {t.last_status === 'success' && '✓ 成功'}
+                                  {t.last_status === 'running' && '● 运行中'}
+                                  {t.last_status === 'error' && '✕ 异常'}
+                                  {t.last_status === 'idle' && '就绪'}
+                                </span>
+                              </>
+                            ) : (
+                              '尚未触发'
+                            )}
+                          </span>
+                        </div>
+                      </div>
+
+                      {t.last_result && (
+                        <div className="task-result-box">
+                          <span className="result-icon">📋</span>
+                          <span className="result-text">{t.last_result}</span>
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="task-card-actions">
+                      <button
+                        type="button"
+                        className="btn-task-action run-now"
+                        disabled={taskRunningId === t.id}
+                        onClick={() => handleRunTaskNow(t)}
+                        title="立即手动触发执行一次"
+                      >
+                        {taskRunningId === t.id ? '⚡ 执行中...' : '⚡ 立即执行'}
+                      </button>
+
+                      <button
+                        type="button"
+                        className="btn-task-action edit-task"
+                        onClick={() => handleOpenEditTask(t)}
+                        title="修改配置 (保存后立刻热重载)"
+                      >
+                        ✏️ 编辑
+                      </button>
+
+                      <button
+                        type="button"
+                        className="btn-task-action delete-task"
+                        onClick={() => handleDeleteTask(t.id, t.name)}
+                        title="删除此定时任务"
+                      >
+                        🗑️ 删除
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </section>
+      )}
+
+      {/* 📚 研报分析与财报解读 RAG 知识库 主页面内容 */}
+      {activeMenu === 'rag_knowledge' && (
+        <RagKnowledgeView
+          getApiUrl={getApiUrl}
+          showToast={showToast}
+          onDocCountChange={(count) => setRagDocCount(count)}
+        />
+      )}
 
       {/* 荐股记录弹窗 (stock_recommendation) */}
       {showRecModal && (
@@ -1104,7 +1455,11 @@ export default function App() {
                     <th>股票代码</th>
                     <th>股票名称</th>
                     <th>买入价格</th>
+                    <th>当日收盘</th>
                     <th>买入日期</th>
+                    <th>次日跌破均线价</th>
+                    <th>荐股评估</th>
+                    <th>是否监控</th>
                     <th>创建时间</th>
                   </tr>
                 </thead>
@@ -1115,7 +1470,44 @@ export default function App() {
                       <td><span className="rec-code-badge">{rec.stock_code}</span></td>
                       <td><strong>{rec.stock_name}</strong></td>
                       <td className="rec-price-cell">¥{Number(rec.buy_price || 0).toFixed(2)}</td>
+                      <td className="rec-price-cell">
+                        {rec.close_price !== null && rec.close_price !== undefined ? (
+                          <span style={{ color: rec.close_price >= rec.buy_price ? '#f87171' : '#4ade80', fontWeight: 600 }}>
+                            ¥{Number(rec.close_price).toFixed(2)}
+                          </span>
+                        ) : (
+                          <span style={{ color: 'var(--text-muted)', fontSize: '0.8rem' }}>待同步</span>
+                        )}
+                      </td>
                       <td>{rec.buy_date}</td>
+                      <td>
+                        {rec.next_day_break_price !== null && rec.next_day_break_price !== undefined ? (
+                          <span style={{ color: rec.next_day_break_price >= rec.buy_price ? '#f87171' : '#fbbf24', fontWeight: 700 }}>
+                            ¥{Number(rec.next_day_break_price).toFixed(2)}
+                          </span>
+                        ) : (
+                          <span style={{ color: 'var(--text-muted)', fontSize: '0.8rem' }}>未跌破/持股中</span>
+                        )}
+                      </td>
+                      <td>
+                        {rec.next_day_break_price !== null && rec.next_day_break_price !== undefined ? (
+                          <span className={`eval-badge ${rec.is_recommend_success ? 'success' : 'fail'}`}>
+                            {rec.is_recommend_success ? '🟢 荐股成功' : '🔴 止损离场'}
+                          </span>
+                        ) : (
+                          <span className="eval-badge pending">🟡 均线上方</span>
+                        )}
+                      </td>
+                      <td>
+                        <button
+                          type="button"
+                          className={`btn-monitor-toggle ${rec.is_monitored !== 0 ? 'monitored' : 'unmonitored'}`}
+                          onClick={() => handleToggleMonitor(rec.id, rec.is_monitored !== 0 ? 0 : 1)}
+                          title="点击切换监控状态"
+                        >
+                          {rec.is_monitored !== 0 ? '🟢 监控中' : '⚪ 已停止'}
+                        </button>
+                      </td>
                       <td className="rec-time-cell">{rec.created_at}</td>
                     </tr>
                   ))}
@@ -1125,213 +1517,6 @@ export default function App() {
             <div className="rec-modal-footer">
               <span className="rec-footer-tip">💡 数据表规则：仅当 (股票代码 + 买入日期) 不重复时自动插入</span>
               <button className="btn-modal-done" onClick={() => setShowRecModal(false)}>关闭</button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* ⏰ 定时任务调度管理中心主弹窗 (sys_cron_task) */}
-      {showTaskModal && (
-        <div className="task-modal-overlay" onClick={() => setShowTaskModal(false)}>
-          <div className="task-modal-dialog" onClick={(e) => e.stopPropagation()}>
-            <div className="task-modal-header">
-              <div className="task-modal-title">
-                <span className="task-title-icon">⏰</span>
-                <div>
-                  <h3>系统定时任务调度管理中心</h3>
-                  <p className="task-modal-sub">
-                    支持对 A 股定时任务动态增删改查，修改后立刻热生效，无需重启服务
-                  </p>
-                </div>
-              </div>
-              <div className="task-header-right-actions">
-                <button
-                  type="button"
-                  className="btn-create-task"
-                  onClick={handleOpenCreateTask}
-                  title="新建定时任务"
-                >
-                  <span>➕ 新增定时任务</span>
-                </button>
-                <button
-                  type="button"
-                  className="btn-sync-now-head"
-                  onClick={handleDirectSyncClosePrices}
-                  title="一键拉取今日推荐标的并回写收盘价"
-                >
-                  <span>⚡ 立即同步收盘价</span>
-                </button>
-                <button
-                  type="button"
-                  className="btn-refresh-tasks"
-                  onClick={fetchTasks}
-                  title="刷新任务列表"
-                >
-                  <span>🔄 刷新</span>
-                </button>
-                <button
-                  className="rec-modal-close"
-                  onClick={() => setShowTaskModal(false)}
-                >
-                  ✕
-                </button>
-              </div>
-            </div>
-
-            <div className="task-modal-body">
-              {tasks.length === 0 ? (
-                <div className="task-empty-state">
-                  <div className="task-empty-icon">📭</div>
-                  <div className="task-empty-title">暂无定时任务</div>
-                  <p>点击上方“➕ 新增定时任务”即可创建自动任务，保存后立刻生效。</p>
-                  <button
-                    type="button"
-                    className="btn-create-task"
-                    onClick={handleOpenCreateTask}
-                  >
-                    ➕ 立即创建任务
-                  </button>
-                </div>
-              ) : (
-                <div className="task-cards-list">
-                  {tasks.map((t) => (
-                    <div
-                      key={t.id}
-                      className={`task-item-card ${t.enabled ? 'is-enabled' : 'is-disabled'}`}
-                    >
-                      <div className="task-card-main">
-                        <div className="task-card-header">
-                          <div className="task-card-title-wrap">
-                            <span className="task-id-badge">#{t.id}</span>
-                            <h4 className="task-card-name">{t.name}</h4>
-                            <span
-                              className="task-script-badge"
-                              title={`运行脚本文件: ${t.python_script || 'agent/sync_close_price.py'}`}
-                            >
-                              🐍 {t.python_script || 'agent/sync_close_price.py'}
-                            </span>
-                          </div>
-
-                          <div className="task-switch-container">
-                            <label
-                              className="task-toggle-switch"
-                              title={t.enabled ? '点击停用' : '点击启用'}
-                            >
-                              <input
-                                type="checkbox"
-                                checked={t.enabled}
-                                onChange={() => handleToggleTask(t.id)}
-                              />
-                              <span className="task-slider"></span>
-                            </label>
-                            <span
-                              className={`task-switch-label ${
-                                t.enabled ? 'enabled' : 'disabled'
-                              }`}
-                            >
-                              {t.enabled ? '运行中' : '已暂停'}
-                            </span>
-                          </div>
-                        </div>
-
-                        <div className="task-meta-grid">
-                          <div className="task-meta-item">
-                            <span className="meta-label">⏰ cron表达式:</span>
-                            <span className="meta-val cron-val">{t.cron_expr}</span>
-                          </div>
-
-                          <div className="task-meta-item">
-                            <span className="meta-label">⏳ 下次触发:</span>
-                            <span className="meta-val next-val">
-                              {t.enabled
-                                ? t.next_run_time || '计算中...'
-                                : '— (任务已暂停)'}
-                            </span>
-                          </div>
-
-                          <div className="task-meta-item">
-                            <span className="meta-label">⏱️ 上次运行:</span>
-                            <span className="meta-val last-val">
-                              {t.last_run_time ? (
-                                <>
-                                  <span>{t.last_run_time}</span>
-                                  <span
-                                    className={`task-status-pill ${
-                                      t.last_status === 'success'
-                                        ? 'status-success'
-                                        : t.last_status === 'running'
-                                        ? 'status-running'
-                                        : 'status-error'
-                                    }`}
-                                  >
-                                    {t.last_status === 'success' && '✓ 成功'}
-                                    {t.last_status === 'running' && '● 运行中'}
-                                    {t.last_status === 'error' && '✕ 异常'}
-                                    {t.last_status === 'idle' && '就绪'}
-                                  </span>
-                                </>
-                              ) : (
-                                '尚未触发'
-                              )}
-                            </span>
-                          </div>
-                        </div>
-
-                        {t.last_result && (
-                          <div className="task-result-box">
-                            <span className="result-icon">📋</span>
-                            <span className="result-text">{t.last_result}</span>
-                          </div>
-                        )}
-                      </div>
-
-                      <div className="task-card-actions">
-                        <button
-                          type="button"
-                          className="btn-task-action run-now"
-                          disabled={taskRunningId === t.id}
-                          onClick={() => handleRunTaskNow(t)}
-                          title="立即手动触发执行一次"
-                        >
-                          {taskRunningId === t.id ? '⚡ 执行中...' : '⚡ 立即执行'}
-                        </button>
-                        <button
-                          type="button"
-                          className="btn-task-action edit-task"
-                          onClick={() => handleOpenEditTask(t)}
-                          title="修改配置 (保存后立刻热重载)"
-                        >
-                          ✏️ 编辑
-                        </button>
-                        <button
-                          type="button"
-                          className="btn-task-action delete-task"
-                          onClick={() => handleDeleteTask(t.id, t.name)}
-                          title="删除此定时任务"
-                        >
-                          🗑️ 删除
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-
-            <div className="task-modal-footer">
-              <div className="task-footer-tip">
-                <span className="tip-pulse">●</span>
-                <span>
-                  💡 <strong>热重载机制保障</strong>：后台常驻调度守护进程运行中，新增、修改、暂停或删除任务<strong>立即生效，无需重启服务</strong>。
-                </span>
-              </div>
-              <button
-                type="button"
-                className="btn-modal-done"
-                onClick={() => setShowTaskModal(false)}
-              >
-                关闭
-              </button>
             </div>
           </div>
         </div>

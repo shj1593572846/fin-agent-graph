@@ -12,3 +12,7 @@ fastapi>=0.100.0
 uvicorn>=0.22.0
 websockets>=11.0.0
 pymysql>=1.0.0
+chromadb>=0.4.0
+pypdf>=3.0.0
+python-docx>=0.8.11
+python-multipart>=0.0.6

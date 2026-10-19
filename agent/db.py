@@ -69,16 +69,30 @@ def ensure_table_and_unique_key(conn) -> None:
         `buy_date` DATE DEFAULT NULL COMMENT '买入日期',
         `next_day_break_price` DECIMAL(10, 2) DEFAULT NULL COMMENT '第二天跌破均线的价格',
         `is_recommend_success` TINYINT(1) DEFAULT 0 COMMENT '是否荐股成功 (1:成功, 0:失败)',
+        `is_monitored` TINYINT(1) DEFAULT 1 COMMENT '是否监控 (1:监控中, 0:未监控/已停止监控)',
         `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
         `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
         INDEX `idx_stock_code` (`stock_code`),
         INDEX `idx_buy_date` (`buy_date`),
         INDEX `idx_is_success` (`is_recommend_success`),
+        INDEX `idx_is_monitored` (`is_monitored`),
         UNIQUE KEY `uk_stock_code_buy_date` (`stock_code`, `buy_date`)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='股票荐股与收益评估记录表';
     """
     with conn.cursor() as cur:
         cur.execute(create_table_sql)
+        # 兼容旧表可能缺少 is_monitored 字段的情况
+        try:
+            cur.execute("SHOW COLUMNS FROM `stock_recommendation` LIKE 'is_monitored';")
+            if not cur.fetchone():
+                cur.execute("""
+                    ALTER TABLE `stock_recommendation` 
+                    ADD COLUMN `is_monitored` TINYINT(1) DEFAULT 1 COMMENT '是否监控 (1:监控中, 0:未监控/已停止监控)' 
+                    AFTER `is_recommend_success`;
+                """)
+                cur.execute("ALTER TABLE `stock_recommendation` ADD INDEX `idx_is_monitored` (`is_monitored`);")
+        except Exception:
+            pass
         # 兼容旧表可能缺少唯一键的情况
         try:
             cur.execute("ALTER TABLE `stock_recommendation` ADD UNIQUE KEY `uk_stock_code_buy_date` (`stock_code`, `buy_date`);")
@@ -399,10 +413,11 @@ def insert_top_recommendation(
     stock_name: str,
     buy_price: float,
     buy_date: Optional[str] = None,
+    is_monitored: int = 1,
 ) -> Tuple[bool, str]:
     """
     往 stock_recommendation 表插入数据（当股票代码 + 买入日期不重复时插入）。
-    插入字段：stock_code (股票代码), stock_name (股票名称), buy_price (买入价格), buy_date (买入日期), created_at (创建时间)
+    插入字段：stock_code (股票代码), stock_name (股票名称), buy_price (买入价格), buy_date (买入日期), is_monitored (是否监控), created_at (创建时间)
     返回: (是否成功执行插入, 结果信息)
     """
     stock_code = str(stock_code).strip().zfill(6)
@@ -434,7 +449,7 @@ def insert_top_recommendation(
         with conn.cursor() as cur:
             # 1. 严格排重检测：当股票代码 + 买入日期已存在时不重复插入
             check_sql = """
-            SELECT `id`, `stock_code`, `stock_name`, `buy_price`, `buy_date`, `created_at` 
+            SELECT `id`, `stock_code`, `stock_name`, `buy_price`, `buy_date`, `is_monitored`, `created_at` 
             FROM `stock_recommendation` 
             WHERE `stock_code` = %s AND `buy_date` = %s 
             LIMIT 1;
@@ -448,14 +463,14 @@ def insert_top_recommendation(
                 )
                 return False, msg
 
-            # 2. 不重复则插入指定字段：股票代码、股票名称、买入价格、买入日期、创建时间
+            # 2. 不重复则插入指定字段：股票代码、股票名称、买入价格、买入日期、是否监控、创建时间
             insert_sql = """
             INSERT INTO `stock_recommendation` 
-                (`stock_code`, `stock_name`, `buy_price`, `buy_date`, `created_at`) 
+                (`stock_code`, `stock_name`, `buy_price`, `buy_date`, `is_monitored`, `created_at`) 
             VALUES 
-                (%s, %s, %s, %s, %s);
+                (%s, %s, %s, %s, %s, %s);
             """
-            cur.execute(insert_sql, (stock_code, stock_name, buy_price, buy_date, created_at))
+            cur.execute(insert_sql, (stock_code, stock_name, buy_price, buy_date, 1 if is_monitored else 0, created_at))
             inserted_id = cur.lastrowid
             msg = (
                 f"🎉 ✅ [数据库入库成功] 排名第一股票【{stock_name}】({stock_code}) 已插入 stock_recommendation 表！\n"
@@ -464,6 +479,7 @@ def insert_top_recommendation(
                 f"    - 股票名称: {stock_name}\n"
                 f"    - 买入价格: ¥{buy_price:.2f}\n"
                 f"    - 买入日期: {buy_date}\n"
+                f"    - 是否监控: {'是 (监控中)' if is_monitored else '否 (已停止)'}\n"
                 f"    - 创建时间: {created_at}"
             )
             return True, msg
@@ -576,6 +592,7 @@ def get_latest_recommendations(limit: int = 20) -> List[Dict[str, Any]]:
                 `buy_date`, 
                 `next_day_break_price`, 
                 `is_recommend_success`, 
+                `is_monitored`,
                 `created_at`, 
                 `updated_at`
             FROM `stock_recommendation`
@@ -596,6 +613,8 @@ def get_latest_recommendations(limit: int = 20) -> List[Dict[str, Any]]:
                     item["close_price"] = float(item["close_price"])
                 if item.get("next_day_break_price") is not None:
                     item["next_day_break_price"] = float(item["next_day_break_price"])
+                if item.get("is_monitored") is not None:
+                    item["is_monitored"] = int(item["is_monitored"])
                 if item.get("created_at"):
                     item["created_at"] = str(item["created_at"])
                 if item.get("updated_at"):
@@ -611,3 +630,173 @@ def get_latest_recommendations(limit: int = 20) -> List[Dict[str, Any]]:
                 conn.close()
             except Exception:
                 pass
+
+
+def update_recommendation_monitor_status(rec_id: int, is_monitored: int) -> Tuple[bool, str]:
+    """更新某条荐股记录的【是否监控】状态 (1: 监控中, 0: 未监控/已停止)"""
+    conn = None
+    try:
+        conn = get_connection()
+        ensure_table_and_unique_key(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE `stock_recommendation` SET `is_monitored` = %s, `updated_at` = NOW() WHERE `id` = %s;",
+                (1 if is_monitored else 0, rec_id),
+            )
+            if cur.rowcount > 0:
+                state_text = "监控中" if is_monitored else "已停止监控"
+                return True, f"✅ 记录 ID #{rec_id} 监控状态已更新为: {state_text}"
+            return False, f"⚠️ 未找到 ID 为 {rec_id} 的荐股记录"
+    except Exception as e:
+        return False, f"❌ 更新监控状态失败: {str(e)}"
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def get_candidates_for_break_monitor(
+    today_str: Optional[str] = None,
+    ignore_date_check: bool = False,
+) -> List[Dict[str, Any]]:
+    """
+    查询需要进行次日量化跌破均线卖出监控的标的列表：
+    条件：
+    1. is_monitored = 1 (处于开启监控状态)
+    2. 当天日期大于买入日期 (buy_date < today_str，满足 A 股 T+1 交易交割规则)
+       (当 ignore_date_check=True 时，可豁免日期限制用于测试模拟)
+    """
+    if not today_str:
+        today_str = datetime.date.today().strftime("%Y-%m-%d")
+    conn = None
+    try:
+        conn = get_connection()
+        ensure_table_and_unique_key(conn)
+        with conn.cursor(pymysql.cursors.DictCursor) as cur:
+            if ignore_date_check:
+                sql = """
+                SELECT 
+                    `id`, 
+                    `stock_code`, 
+                    `stock_name`, 
+                    `buy_price`, 
+                    `close_price`, 
+                    `buy_date`, 
+                    `next_day_break_price`, 
+                    `is_recommend_success`, 
+                    `is_monitored`, 
+                    `created_at`
+                FROM `stock_recommendation`
+                WHERE `is_monitored` = 1
+                ORDER BY `buy_date` ASC, `id` ASC;
+                """
+                cur.execute(sql)
+            else:
+                sql = """
+                SELECT 
+                    `id`, 
+                    `stock_code`, 
+                    `stock_name`, 
+                    `buy_price`, 
+                    `close_price`, 
+                    `buy_date`, 
+                    `next_day_break_price`, 
+                    `is_recommend_success`, 
+                    `is_monitored`, 
+                    `created_at`
+                FROM `stock_recommendation`
+                WHERE `is_monitored` = 1 AND `buy_date` < %s
+                ORDER BY `buy_date` ASC, `id` ASC;
+                """
+                cur.execute(sql, (today_str,))
+
+            rows = cur.fetchall()
+            results = []
+            for r in rows:
+                item = dict(r)
+                if item.get("buy_date"):
+                    item["buy_date"] = str(item["buy_date"])
+                if item.get("buy_price") is not None:
+                    item["buy_price"] = float(item["buy_price"])
+                if item.get("close_price") is not None:
+                    item["close_price"] = float(item["close_price"])
+                if item.get("next_day_break_price") is not None:
+                    item["next_day_break_price"] = float(item["next_day_break_price"])
+                if item.get("is_monitored") is not None:
+                    item["is_monitored"] = int(item["is_monitored"])
+                if item.get("is_recommend_success") is not None:
+                    item["is_recommend_success"] = int(item["is_recommend_success"])
+                if item.get("created_at"):
+                    item["created_at"] = str(item["created_at"])
+                results.append(item)
+            return results
+    except Exception as e:
+        print(f"⚠️ 查询次日量化监控标的失败: {str(e)}")
+        return []
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def record_break_sell(
+    rec_id: int,
+    break_price: float,
+    buy_price: float,
+    break_time: str = "",
+) -> Tuple[bool, str]:
+    """
+    当个股分时跌破分时均线时，执行卖出信号记录：
+    1. 记录第二天跌破均线的价格 (next_day_break_price)
+    2. 评估是否荐股成功 (is_recommend_success: 跌破价格 >= 买入价格 为 1，否则为 0)
+    3. 移出量化监控 (is_monitored = 0)
+    4. 更新时间 updated_at = NOW()
+    """
+    conn = None
+    try:
+        break_p = round(float(break_price), 2)
+        buy_p = round(float(buy_price), 2)
+        is_success = 1 if break_p >= buy_p else 0
+        diff_p = round(break_p - buy_p, 2)
+        diff_pct = round((diff_p / buy_p * 100.0), 2) if buy_p > 0 else 0.0
+
+        conn = get_connection()
+        ensure_table_and_unique_key(conn)
+        with conn.cursor() as cur:
+            update_sql = """
+            UPDATE `stock_recommendation`
+            SET 
+                `next_day_break_price` = %s,
+                `is_recommend_success` = %s,
+                `is_monitored` = 0,
+                `updated_at` = NOW()
+            WHERE `id` = %s;
+            """
+            cur.execute(update_sql, (break_p, is_success, rec_id))
+            if cur.rowcount > 0:
+                eval_str = "盈利/保本离场 (荐股成功 ✅)" if is_success == 1 else "触发止损离场 (荐股失败 ❌)"
+                time_info = f" [{break_time}]" if break_time else ""
+                msg = (
+                    f"🎯 [卖出信号触发]{time_info} 标的 ID #{rec_id} 分时跌破均线！\n"
+                    f"    - 跌破均线价格: ¥{break_p:.2f}\n"
+                    f"    - 初始买入价格: ¥{buy_p:.2f}\n"
+                    f"    - 收益价差幅度: {diff_p:+.2f} ({diff_pct:+.2f}%)\n"
+                    f"    - 最终荐股成效: {eval_str} (is_recommend_success={is_success})\n"
+                    f"    - 监控状态更新: 已终止监控 (is_monitored=0)"
+                )
+                return True, msg
+            return False, f"⚠️ 未找到对应 ID #{rec_id} 的推荐记录"
+    except Exception as e:
+        return False, f"❌ 记录跌破均线卖出异常: {str(e)}"
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+

@@ -239,21 +239,35 @@ class TaskScheduler:
                 cur.execute("SELECT `id`, `name`, `python_script`, `cron_expr`, `enabled`, `last_run_time`, `last_status`, `last_result`, `next_run_time` FROM `sys_cron_task` ORDER BY `id` ASC;")
                 rows = cur.fetchall()
 
-                # 若表为空，插入默认预设任务（用户重点要求的：收盘价自动同步，以及选股策略）
+                # 若表为空，插入默认预设任务
                 if not rows:
                     seed_sql = """
                     INSERT INTO `sys_cron_task` 
-                        (`name`, `python_script`, `cron_expr`, `enabled`, `last_result`) 
+                        (`name`, `python_script`, `cron_expr`, `enabled`, `last_result`)
                     VALUES 
+                        (%s, %s, %s, %s, %s),
                         (%s, %s, %s, %s, %s),
                         (%s, %s, %s, %s, %s);
                     """
                     cur.execute(seed_sql, (
-                        "A股收盘价自动同步", "agent/sync_close_price.py", "10 15 * * 1-5", 1, "开盘日每天15:10自动执行 agent/sync_close_price.py 更新当日收盘价",
-                        "早盘全市场智能选股", "agent/main.py", "30 9 * * 1-5", 0, "开盘日每天09:30自动执行 agent/main.py 选股策略流水线",
+                        "A股收盘价自动同步", "agent/sync_close_price.py", "10 15 * * 1-5", 1, "开市日每天15:10自动执行 agent/sync_close_price.py 更新当日收盘价",
+                        "早盘全市场智能选股", "agent/main.py", "30 9 * * 1-5", 0, "开市日每天09:30自动执行 agent/main.py 选股策略流水线",
+                        "A股次日量化跌破均线卖出监控", "agent/monitor_break_price.py", "*/1 9-14 * * 1-5", 1, "开市日盘中每分钟动态监控次日推荐个股分时，跌破均线自动执行卖出研判并回写记录",
                     ))
                     cur.execute("SELECT `id`, `name`, `python_script`, `cron_expr`, `enabled`, `last_run_time`, `last_status`, `last_result`, `next_run_time` FROM `sys_cron_task` ORDER BY `id` ASC;")
                     rows = cur.fetchall()
+                else:
+                    # 检查既有表中是否缺少次日量化监控任务，若无则平滑增补
+                    cur.execute("SELECT COUNT(*) FROM `sys_cron_task` WHERE `python_script` = 'agent/monitor_break_price.py';")
+                    if cur.fetchone()[0] == 0:
+                        cur.execute("""
+                        INSERT INTO `sys_cron_task` 
+                            (`name`, `python_script`, `cron_expr`, `enabled`, `last_status`, `last_result`)
+                        VALUES 
+                            ('A股次日量化跌破均线卖出监控', 'agent/monitor_break_price.py', '*/1 9-14 * * 1-5', 1, 'idle', '开市日盘中每分钟动态监控次日推荐个股分时，跌破均线自动执行卖出研判并回写记录');
+                        """)
+                        cur.execute("SELECT `id`, `name`, `python_script`, `cron_expr`, `enabled`, `last_run_time`, `last_status`, `last_result`, `next_run_time` FROM `sys_cron_task` ORDER BY `id` ASC;")
+                        rows = cur.fetchall()
 
                 for r in rows:
                     t_id = int(r[0])
@@ -309,10 +323,34 @@ class TaskScheduler:
             "enabled": True,
             "last_run_time": None,
             "last_status": "idle",
-            "last_result": "开盘日每天15:10自动执行 agent/sync_close_price.py 更新当日收盘价",
+            "last_result": "开市日每天15:10自动执行 agent/sync_close_price.py 更新当日收盘价",
             "next_run_time": calculate_next_run("10 15 * * 1-5").strftime("%Y-%m-%d %H:%M:%S"),
         }
+        t2 = {
+            "id": 2,
+            "name": "早盘全市场智能选股",
+            "python_script": "agent/main.py",
+            "cron_expr": "30 9 * * 1-5",
+            "enabled": False,
+            "last_run_time": None,
+            "last_status": "idle",
+            "last_result": "开市日每天09:30自动执行 agent/main.py 选股策略流水线",
+            "next_run_time": calculate_next_run("30 9 * * 1-5").strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        t3 = {
+            "id": 3,
+            "name": "A股次日量化跌破均线卖出监控",
+            "python_script": "agent/monitor_break_price.py",
+            "cron_expr": "*/1 9-14 * * 1-5",
+            "enabled": True,
+            "last_run_time": None,
+            "last_status": "idle",
+            "last_result": "开市日盘中每分钟动态监控次日推荐个股分时，跌破均线自动执行卖出研判并回写记录",
+            "next_run_time": calculate_next_run("*/1 9-14 * * 1-5").strftime("%Y-%m-%d %H:%M:%S"),
+        }
         self.tasks[1] = t1
+        self.tasks[2] = t2
+        self.tasks[3] = t3
         self._save_to_json()
 
     def _save_to_json(self):

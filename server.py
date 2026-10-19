@@ -8,10 +8,23 @@ import sys
 import asyncio
 import subprocess
 import signal
-from typing import Optional
+from typing import Optional, Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+# 确保在 Windows 环境下优先启用 ProactorEventLoop，支持异步管道通信与子进程创建
+if sys.platform == "win32":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    except Exception:
+        pass
+
+
+def proactor_loop_factory(*args, **kwargs):
+    """供 uvicorn 自定义 loop 参数调用的工厂函数，确保在 Windows 上始终使用 ProactorEventLoop"""
+    return asyncio.ProactorEventLoop()
+
 
 app = FastAPI(title="LangGraph Stock Picker API Server", version="1.0.0")
 
@@ -23,8 +36,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-current_process: Optional[asyncio.subprocess.Process] = None
+current_process: Optional[Any] = None
 process_lock = asyncio.Lock()
+
 
 
 class RunRequest(BaseModel):
@@ -34,13 +48,25 @@ class RunRequest(BaseModel):
 
 @app.on_event("startup")
 async def startup_event():
-    """服务启动时自动拉起常驻定时任务后台监听引擎"""
+    """服务启动时自动拉起常驻定时任务后台监听引擎与 RAG 知识库"""
     try:
         from agent.scheduler import scheduler_instance
         scheduler_instance.start()
         print("⏰ [FastAPI Startup] 定时任务常驻调度引擎已成功启动就绪！")
     except Exception as e:
         print(f"⚠️ [FastAPI Startup] 启动定时任务调度引擎失败: {e}")
+
+    try:
+        from rag import rag_service
+        rag_service.init_samples_if_empty()
+        print("📚 [FastAPI Startup] RAG 研报财报知识库已成功就绪！")
+    except Exception as e:
+        print(f"⚠️ [FastAPI Startup] 启动 RAG 知识库失败: {e}")
+
+
+# 挂载 RAG 研报分析与财报解读知识库模块路由
+from rag import rag_router
+app.include_router(rag_router)
 
 
 @app.get("/api/health")
@@ -63,6 +89,22 @@ async def get_recommendations(limit: int = 20):
         return {"success": True, "data": records, "count": len(records)}
     except Exception as e:
         return {"success": False, "error": str(e), "data": [], "count": 0}
+
+
+class RecommendationMonitorRequest(BaseModel):
+    is_monitored: int = 1
+
+
+@app.post("/api/recommendations/{rec_id}/monitor")
+async def set_recommendation_monitor(rec_id: int, req: Optional[RecommendationMonitorRequest] = None):
+    """更新某条股票推荐记录的【是否监控】状态"""
+    try:
+        from agent import db
+        target_status = req.is_monitored if req is not None else 1
+        success, msg = db.update_recommendation_monitor_status(rec_id, target_status)
+        return {"success": success, "message": msg, "is_monitored": target_status}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 # ==============================================================================
@@ -167,27 +209,59 @@ async def trigger_sync_close_prices(target_date: Optional[str] = None):
         return {"success": False, "error": str(e)}
 
 
+class MonitorBreakPriceRequest(BaseModel):
+    force: bool = False
+    ignore_date: bool = False
+
+
+@app.post("/api/tasks/monitor-break-prices")
+async def trigger_monitor_break_prices(req: Optional[MonitorBreakPriceRequest] = None):
+    """一键手动触发 A 股次日量化跌破分时均线卖出监控研判"""
+    try:
+        from agent.monitor_break_price import run_monitor_scan
+        force = req.force if req else False
+        ignore_date = req.ignore_date if req else False
+        res = run_monitor_scan(force_run=force, ignore_date_check=ignore_date)
+        return res
+    except Exception as e:
+        return {"success": False, "error": str(e), "message": f"次日量化监控执行异常: {str(e)}"}
+
+
+@app.get("/api/monitor/candidates")
+async def get_monitor_candidates():
+    """查询当前处于【需要次日量化监控】(is_monitored=1 且 当天 > 买入日期) 的持仓标的列表"""
+    try:
+        from agent.db import get_candidates_for_break_monitor
+        candidates = get_candidates_for_break_monitor()
+        return {"success": True, "data": candidates, "count": len(candidates)}
+    except Exception as e:
+        return {"success": False, "error": str(e), "data": [], "count": 0}
+
+
+
 @app.post("/api/stop")
 async def stop_execution():
     """强制中止当前正在运行的 main.py 进程树"""
     global current_process
     async with process_lock:
-        if current_process and current_process.returncode is None:
-            try:
-                pid = current_process.pid
-                if sys.platform == "win32":
-                    subprocess.run(
-                        ["taskkill", "/F", "/T", "/PID", str(pid)],
-                        capture_output=True,
-                        text=True,
-                    )
-                else:
-                    current_process.send_signal(signal.SIGTERM)
-                return {"success": True, "message": f"进程 PID {pid} 已中止"}
-            except Exception as e:
-                return {"success": False, "message": f"中止失败: {str(e)}"}
-            finally:
-                current_process = None
+        if current_process:
+            ret = getattr(current_process, "returncode", None)
+            if ret is None:
+                try:
+                    pid = current_process.pid
+                    if sys.platform == "win32":
+                        subprocess.run(
+                            ["taskkill", "/F", "/T", "/PID", str(pid)],
+                            capture_output=True,
+                            text=True,
+                        )
+                    else:
+                        current_process.terminate()
+                    return {"success": True, "message": f"进程 PID {pid} 已中止"}
+                except Exception as e:
+                    return {"success": False, "message": f"中止失败: {str(e)}"}
+                finally:
+                    current_process = None
         return {"success": False, "message": "当前没有正在运行的任务"}
 
 
@@ -209,7 +283,7 @@ async def websocket_run(websocket: WebSocket):
         fast_mode = bool(init_data.get("fast_mode", True))
 
         async with process_lock:
-            if current_process and current_process.returncode is None:
+            if current_process and getattr(current_process, "returncode", None) is None:
                 await websocket.send_json({
                     "type": "error",
                     "content": "⚠️ 系统当前已有选股任务在运行中，请等待其完成或点击终止后再启动！\n"
@@ -248,14 +322,28 @@ async def websocket_run(websocket: WebSocket):
                 "content": f"⚡ 正在拉起六节点 LangGraph 协同工作流 {'[🚀 极速模式]' if fast_mode else '[🔄 深度全网模式]'}: {' '.join(cmd)}\n\n"
             })
 
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                env=env,
-                cwd=os.getcwd(),
-            )
-            current_process = proc
+            use_async_proc = True
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    env=env,
+                    cwd=os.getcwd(),
+                )
+                current_process = proc
+            except NotImplementedError:
+                # 兼容 Windows SelectorEventLoop 无法创建异步子进程的场景
+                use_async_proc = False
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                    cwd=os.getcwd(),
+                    bufsize=0,
+                )
+                current_process = proc
 
         # 后台任务监听客户端中止指令
         async def client_listener():
@@ -271,9 +359,14 @@ async def websocket_run(websocket: WebSocket):
         listener_task = asyncio.create_task(client_listener())
 
         try:
+            loop = asyncio.get_running_loop()
             # 实时无缓冲读取输出流 (每次读取可用字节，即刻推送)
             while True:
-                chunk_bytes = await proc.stdout.read(1024)
+                if use_async_proc:
+                    chunk_bytes = await proc.stdout.read(1024)
+                else:
+                    chunk_bytes = await loop.run_in_executor(None, proc.stdout.read, 1024)
+
                 if not chunk_bytes:
                     break
                 chunk_text = chunk_bytes.decode("utf-8", errors="replace")
@@ -282,7 +375,11 @@ async def websocket_run(websocket: WebSocket):
                     "content": chunk_text
                 })
 
-            return_code = await proc.wait()
+            if use_async_proc:
+                return_code = await proc.wait()
+            else:
+                return_code = await loop.run_in_executor(None, proc.wait)
+
             await websocket.send_json({
                 "type": "finish",
                 "exit_code": return_code,
@@ -297,10 +394,14 @@ async def websocket_run(websocket: WebSocket):
     except WebSocketDisconnect:
         pass
     except Exception as e:
+        import traceback
+        err_msg = traceback.format_exc()
+        print(f"❌ WebSocket 运行异常:\n{err_msg}")
         try:
+            err_detail = f"{type(e).__name__}: {str(e)}" if str(e) else type(e).__name__
             await websocket.send_json({
                 "type": "error",
-                "content": f"\n❌ 服务端异常: {str(e)}\n"
+                "content": f"\n❌ 服务端异常: {err_detail}\n"
             })
         except Exception:
             pass
@@ -308,4 +409,15 @@ async def websocket_run(websocket: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)
+    # 在 Windows 下若开启 reload，uvicorn 默认会切换为 SelectorEventLoop 并监控目录，导致频繁重启与子进程受限；
+    # 此处默认以稳态运行 (reload=False)，并优先注入 ProactorEventLoop 工厂保证流式管道高稳定输出
+    uvicorn_kwargs = {
+        "app": "server:app",
+        "host": "0.0.0.0",
+        "port": 8000,
+        "reload": False,
+    }
+    if sys.platform == "win32":
+        uvicorn_kwargs["loop"] = "server:proactor_loop_factory"
+    uvicorn.run(**uvicorn_kwargs)
+

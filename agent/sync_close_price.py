@@ -77,7 +77,7 @@ def run_sync(target_date: str = "") -> bool:
 
         with conn.cursor() as cur:
             query_sql = """
-            SELECT `id`, `stock_code`, `stock_name`, `buy_price`, `close_price`, `buy_date`
+            SELECT `id`, `stock_code`, `stock_name`, `buy_price`, `close_price`, `buy_date`, `is_monitored`
             FROM `stock_recommendation`
             WHERE `buy_date` = %s;
             """
@@ -97,6 +97,11 @@ def run_sync(target_date: str = "") -> bool:
                 code = str(row[1]).strip().zfill(6)
                 name = str(row[2]).strip()
                 buy_p = float(row[3]) if row[3] is not None else 0.0
+                is_mon = row[6] if len(row) > 6 and row[6] is not None else 1
+
+                if is_mon == 0:
+                    print(f"⏸️ 标的【{name}】({code}) 当前【已停止监控】(is_monitored=0)，跳过收盘价同步。")
+                    continue
 
                 close_p = fetch_realtime_close_price(code)
                 if close_p is None or close_p <= 0:
