@@ -21,6 +21,7 @@ from rag.config import (
 from rag.document_loader import load_document_content
 from rag.text_splitter import split_document_pages
 from rag.vector_store import vector_store
+from rag.skill import financial_rag_skill, FinancialRAGSkill
 
 # 导入项目中已有的大模型接口
 _CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -59,8 +60,9 @@ class FinancialRAGService:
         return cls._instance
 
     def _init_service(self):
-        """初始化服务并加载元数据"""
+        """初始化服务并加载元数据与专属问答 Skill"""
         self.metadata_lock = threading.Lock()
+        self.skill = financial_rag_skill
         self._ensure_metadata_file()
         # 若知识库为空，自动预热加载样本数据
         self.init_samples_if_empty()
@@ -309,107 +311,32 @@ class FinancialRAGService:
         category: Optional[str] = None,
         stock_code: Optional[str] = None,
         top_k: int = 4,
-        generate_answer: bool = True
+        generate_answer: bool = True,
+        session_id: str = "default",
+        use_memory: Optional[bool] = None,
+        search_mode: Optional[str] = "hybrid",
     ) -> Dict[str, Any]:
         """
-        基于知识库分块检索并调用大模型进行投研与财报问答分析
+        基于金融知识库智能问答 Skill 执行混合检索 (Vector + BM25 + RRF)、滑动窗口对话记忆关联与深度研报/财报分析
         """
-        query_clean = query.strip()
-        if not query_clean:
-            return {
-                "query": query,
-                "answer": "请输入您想咨询的研报核心逻辑或财报财务指标问题。",
-                "sources": [],
-                "success": True,
-            }
-
-        # 1. 向量相似度语义检索
-        matched_chunks = vector_store.query_similarity(
-            query_text=query_clean,
-            n_results=top_k,
+        return self.skill.execute(
+            query=query,
             category=category,
             stock_code=stock_code,
+            top_k=top_k,
+            generate_answer=generate_answer,
+            session_id=session_id,
+            use_memory=use_memory,
+            search_mode=search_mode,
         )
 
-        if not matched_chunks:
-            # 若按特定条件无结果且指定了分类，尝试不限分类重试
-            if category and category != "全部":
-                matched_chunks = vector_store.query_similarity(
-                    query_text=query_clean,
-                    n_results=top_k,
-                    category=None,
-                    stock_code=stock_code,
-                )
+    def get_memory_turns(self, session_id: str = "default") -> List[Dict[str, Any]]:
+        """获取指定会话在滑动窗口中的全部对话历史"""
+        return self.skill.get_memory_turns(session_id)
 
-        if not matched_chunks:
-            return {
-                "query": query_clean,
-                "answer": "🔍 知识库中暂未检索到与您提问高度相关的研报或财报内容。\n\n建议您：\n1. 上传相关的个股研报 PDF 或财报文件；\n2. 尝试换用更明确的标的名称（如「贵州茅台」、「宁德时代」、「比亚迪」）或核心财务指标（如「营收增长率」、「毛利率」、「投资评级」）。",
-                "sources": [],
-                "success": True,
-            }
-
-        # 2. 构建上下文文本片段
-        context_blocks = []
-        for idx, c in enumerate(matched_chunks):
-            doc_tag = f"【资料 {idx+1}】《{c['title']}》 ({c['category']} | 标的: {c['stock_code']} {c['stock_name']} | 页码: {c['page']})"
-            context_blocks.append(f"{doc_tag}\n{c['text']}")
-
-        context_str = "\n\n----------------------------------------\n\n".join(context_blocks)
-
-        if not generate_answer:
-            return {
-                "query": query_clean,
-                "category": category or "全部",
-                "answer": "",
-                "sources": matched_chunks,
-                "success": True,
-            }
-
-        # 3. 构造专业金融分析师 Prompt
-        system_prompt = (
-            "你是一位具备十余年资深经验的顶尖证券研究所行业首席分析师兼注册会计师（CPA）。\n"
-            "你的任务是基于提供的【研报分析】与【财报解读】知识库参考资料，精准、深入、客观地回答用户的投研或财务问题。\n\n"
-            "【输出专业规范】\n"
-            "1. 严谨引用数据：优先引用资料中的关键财务指标（如营收、归母净利润、毛利率、扣非净利、现金流、PE/PB 估值、目标价等）；\n"
-            "2. 结构清晰：使用 Markdown 格式，通过分级标题、要点列表或数据对比表格清晰展现核心观点；\n"
-            "3. 核心维度涵盖：\n"
-            "   - 财报解读需注重：成长性、盈利质量、杜邦分析、现金流安全边际与潜在财务瑕疵；\n"
-            "   - 研报分析需注重：投资评级、核心催化剂、竞争护城河、技术代际壁垒与估值空间；\n"
-            "4. 真实客观：若资料中未提及某项数据，应如实客观说明，严禁凭空捏造财务数字。"
-        )
-
-        user_prompt = (
-            f"【用户咨询问题】\n{query_clean}\n\n"
-            f"【检索到的研报与财报资料库】\n{context_str}\n\n"
-            "请基于以上资料，给出专业、详实的投研分析与深度解答："
-        )
-
-        answer_text = ""
-        try:
-            llm = get_llm(temperature=0.2, max_tokens=2500)
-            from langchain_core.messages import SystemMessage, HumanMessage
-            response = llm.invoke([
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=user_prompt),
-            ])
-            answer_text = response.content if hasattr(response, "content") else str(response)
-        except Exception as e:
-            print(f"❌ [RAG LLM Invocation Error]: {e}")
-            # 优雅降级：直接展示检索到的最相关上下文
-            answer_text = (
-                f"⚠️ 大模型分析生成暂时异常 ({type(e).__name__}: {str(e)})。\n\n"
-                f"为您直接提取知识库中最匹配的原文段落如下：\n\n"
-                f"{matched_chunks[0]['text']}"
-            )
-
-        return {
-            "query": query_clean,
-            "category": category or "全部",
-            "answer": answer_text,
-            "sources": matched_chunks,
-            "success": True,
-        }
+    def clear_memory(self, session_id: Optional[str] = None) -> bool:
+        """清空指定会话或全部滑动窗口记忆"""
+        return self.skill.clear_memory(session_id)
 
     def get_stats(self) -> Dict[str, Any]:
         """获取知识库总体统计数据"""

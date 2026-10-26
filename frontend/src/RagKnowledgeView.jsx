@@ -213,6 +213,9 @@ export default function RagKnowledgeView({ getApiUrl, showToast, onDocCountChang
   const [answer, setAnswer] = useState(null)
   const [sources, setSources] = useState([])
   const [showSources, setShowSources] = useState(true)
+  const [memoryTurns, setMemoryTurns] = useState(0)
+  const [memoryWindowSize, setMemoryWindowSize] = useState(5)
+  const [searchMode, setSearchMode] = useState('hybrid') // 'hybrid' | 'vector' | 'bm25'
 
   // 手动上传本地文件模态框状态
   const [showUploadModal, setShowUploadModal] = useState(false)
@@ -317,6 +320,9 @@ export default function RagKnowledgeView({ getApiUrl, showToast, onDocCountChang
           stock_code: qaStockCode ? qaStockCode.trim() : null,
           top_k: 4,
           generate_answer: true,
+          session_id: 'default',
+          use_memory: true,
+          search_mode: searchMode,
         }),
       })
       const json = await res.json()
@@ -324,6 +330,12 @@ export default function RagKnowledgeView({ getApiUrl, showToast, onDocCountChang
         setAnswer(json.data.answer || '未生成有效分析内容')
         setSources(json.data.sources || [])
         setShowSources(true)
+        if (json.data.memory_turns !== undefined) {
+          setMemoryTurns(json.data.memory_turns)
+        }
+        if (json.data.memory_window_size !== undefined) {
+          setMemoryWindowSize(json.data.memory_window_size)
+        }
         showToast('✨ 投研研报与财报问答分析已完成')
       } else {
         showToast(`❌ 问答请求异常: ${json.error || '未知错误'}`)
@@ -332,6 +344,22 @@ export default function RagKnowledgeView({ getApiUrl, showToast, onDocCountChang
       showToast(`❌ 网络请求失败: ${err.message}`)
     } finally {
       setAsking(false)
+    }
+  }
+
+  // 清空滑动窗口记忆
+  const handleClearMemory = async () => {
+    try {
+      const res = await fetch(getApiUrl('/api/rag/memory?session_id=default'), { method: 'DELETE' })
+      const json = await res.json()
+      if (json.success) {
+        setMemoryTurns(0)
+        showToast('🧠 已清空当前滑动窗口多轮对话记忆！')
+      } else {
+        showToast(`清空记忆异常: ${json.error || '未知错误'}`)
+      }
+    } catch (err) {
+      showToast(`清空记忆失败: ${err.message}`)
     }
   }
 
@@ -782,6 +810,47 @@ export default function RagKnowledgeView({ getApiUrl, showToast, onDocCountChang
                   onChange={(e) => setQaStockCode(e.target.value)}
                 />
               </div>
+
+              <div className="search-mode-filter-wrap">
+                <span className="filter-title">🔍 检索模式：</span>
+                <div className="cat-radio-group">
+                  {[
+                    { id: 'hybrid', label: '🔀 混合检索 (Vector+BM25)', tip: '稠密向量 + BM25稀疏 + RRF 倒数排名融合重排' },
+                    { id: 'vector', label: '🧠 语义向量', tip: 'ChromaDB 稠密嵌入语义相似度检索' },
+                    { id: 'bm25', label: '🔤 词面BM25', tip: 'Okapi BM25 稀疏精确字面关键词匹配' },
+                  ].map((m) => (
+                    <label
+                      key={m.id}
+                      className={`cat-radio-label ${searchMode === m.id ? 'active' : ''}`}
+                      title={m.tip}
+                    >
+                      <input
+                        type="radio"
+                        name="searchMode"
+                        value={m.id}
+                        checked={searchMode === m.id}
+                        onChange={() => setSearchMode(m.id)}
+                      />
+                      <span>{m.label}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              <div className="memory-filter-wrap">
+                <span className="filter-title">🧠 滑动窗口记忆：</span>
+                <span className="memory-badge-count">{memoryTurns}/{memoryWindowSize} 轮</span>
+                {memoryTurns > 0 && (
+                  <button
+                    type="button"
+                    className="btn-clear-mem-inline"
+                    onClick={handleClearMemory}
+                    title="清空当前会话滑动窗口历史记忆"
+                  >
+                    重置记忆
+                  </button>
+                )}
+              </div>
             </div>
 
             <div className="query-input-row">
@@ -886,13 +955,34 @@ export default function RagKnowledgeView({ getApiUrl, showToast, onDocCountChang
                             <span className={`cat-pill ${s.category === '研报分析' ? 'research' : 'financial'}`}>
                               {s.category}
                             </span>
+                            {s.retrieval_method === 'hybrid_rrf' ? (
+                              <span
+                                className="method-pill hybrid"
+                                title={`混合检索(RRF融合) | 向量排名: #${s.dense_rank || '未入选'} | BM25词面排名: #${s.sparse_rank || '未入选'}`}
+                              >
+                                🔀 混合检索 {s.dense_rank ? `V#${s.dense_rank}` : ''}{s.sparse_rank ? `+B#${s.sparse_rank}` : ''}
+                              </span>
+                            ) : s.retrieval_method === 'sparse_bm25' ? (
+                              <span className="method-pill bm25" title="BM25 词面精确匹配召回">
+                                🔤 词面BM25
+                              </span>
+                            ) : (
+                              <span className="method-pill vector" title="Dense 语义向量相似度召回">
+                                🧠 语义向量
+                              </span>
+                            )}
                             {s.stock_name && (
                               <span className="stock-pill">
                                 {s.stock_code} {s.stock_name}
                               </span>
                             )}
-                            <span className="score-pill" title="语义相关度匹配分数">
-                              相似度 {Math.round(s.score * 100)}%
+                            <span
+                              className="score-pill"
+                              title={s.retrieval_method === 'hybrid_rrf' ? `RRF融合归一化得分: ${s.score}` : `相似度匹配分数: ${s.score}`}
+                            >
+                              {s.retrieval_method === 'hybrid_rrf'
+                                ? `综合评分 ${(s.score * 100).toFixed(1)}%`
+                                : `相似度 ${Math.round(s.score * 100)}%`}
                             </span>
                           </div>
                         </div>

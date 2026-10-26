@@ -1161,9 +1161,9 @@ def query_financial_rag_knowledge(query: str, category: str = "", stock_code: st
     - stock_code: 可选股票代码（如 '600519'），留空则全局语义匹配
     """
     try:
-        from rag.rag_service import rag_service
+        from rag.skill import financial_rag_skill
         cat = category if category in ["研报分析", "财报解读"] else None
-        res = rag_service.query_rag(
+        res = financial_rag_skill.execute(
             query=query,
             category=cat,
             stock_code=stock_code,
@@ -1181,6 +1181,14 @@ def query_financial_rag_knowledge(query: str, category: str = "", stock_code: st
         return "\n".join(output)
     except Exception as e:
         return f"查询 RAG 知识库异常: {str(e)}"
+
+
+# 导出由 Skill 自动生成的 LangChain 问答完整分析 Tool (可直接供 ReAct / LangGraph 智能体调用)
+try:
+    from rag.skill import financial_rag_skill
+    financial_rag_qa_tool = financial_rag_skill.as_tool()
+except Exception:
+    financial_rag_qa_tool = None
 
 
 COLLECTOR_TOOLS = [

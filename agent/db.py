@@ -13,9 +13,15 @@ from dotenv import load_dotenv
 
 # 适配 Windows 控制台编码，防止 Emoji 及中文字符输出异常
 if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 # 加载环境变量
 _CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -107,134 +113,105 @@ def extract_buy_order_high_price(
     default_price: float = 0.0,
 ) -> Tuple[float, str]:
     """
-    从终审研报第三板块【日内操盘买卖点与精准挂单区间】中，
-    精准提取目标股票的【买入挂单区间】（或建议低吸买点区间）最高价位。
+    从终审研报中精准提取目标股票的【建议低吸买点区间】（或买入挂单区间）最高值。
+    优先检索全文（包括第一板块决策矩阵表、第三板块实战操盘表及个股分析明细）：
+    1. 策略 A：解析所有 Markdown 表格，查找【建议低吸买点区间】/【买入挂单区间】列对应目标股票行；
+    2. 策略 B：查找个股专属段落或清单中的【建议低吸买点区间】；
+    3. 策略 C：全局正则穿透匹配区间；
+    4. 兜底策略：若未在文本中解析到区间，则以基准价（最新价/现价）的建议低吸买点区间最高值 (基准价 * 1.002) 自动推导计算。
 
     返回: (buy_price_high: float, raw_interval_str: str)
     """
     text = str(decision_text or "").strip()
     code = str(stock_code or "").strip().zfill(6) if stock_code else ""
     name = str(stock_name or "").strip()
-
-    if not text:
-        return (round(float(default_price), 2) if default_price > 0 else 0.0, "")
-
-    # 1. 定位第三板块【日内操盘买卖点与精准挂单区间】文本切片
-    p3_patterns = [
-        r"##\s*三[、.][^\n]*",
-        r"三[、.][^\n]*(?:日内操盘|买卖点|精准挂单|挂单区间|操盘策略)",
-        r"【日内操盘买卖点与精准挂单区间】",
-        r"【日内操盘",
-    ]
-    p3_start = -1
-    for pat in p3_patterns:
-        m = re.search(pat, text)
-        if m:
-            p3_start = m.start()
-            break
-
-    p4_patterns = [
-        r"##\s*四[、.][^\n]*",
-        r"四[、.][^\n]*(?:风控铁律|分时动态止损|仓位管理)",
-        r"【风控铁律",
-    ]
-    p3_end = len(text)
-    if p3_start != -1:
-        for pat in p4_patterns:
-            m = re.search(pat, text[p3_start:])
-            if m:
-                p3_end = p3_start + m.start()
-                break
-        section3_text = text[p3_start:p3_end]
-    else:
-        section3_text = text
+    try:
+        default_price = float(default_price)
+    except (ValueError, TypeError):
+        default_price = 0.0
 
     raw_interval = ""
 
-    # 2. 策略 A：按个股子板块定位（如 ### 🥇 第1名：大智慧（601519）下方的专属表格或清单）
-    stock_identifiers = []
-    if code:
-        stock_identifiers.append(code)
-    if name:
-        stock_identifiers.append(name)
-    stock_identifiers.extend(["第1名", "第 1 名", "Top 1", "Top1", "核心龙头"])
+    if text:
+        # 1. 策略 A：扫描全文所有 Markdown 表格，查找包含【建议低吸买点区间】或【买入挂单区间】等列的表格
+        tbl_blocks = []
+        cur_tbl = []
+        for line in text.split("\n"):
+            s_line = line.strip()
+            if s_line.startswith("|"):
+                cur_tbl.append(s_line)
+            else:
+                if cur_tbl:
+                    tbl_blocks.append(cur_tbl)
+                    cur_tbl = []
+        if cur_tbl:
+            tbl_blocks.append(cur_tbl)
 
-    lines = section3_text.split("\n")
-    stock_block_lines = []
-    in_target_block = False
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("#"):
-            if any(ident in stripped for ident in stock_identifiers):
-                in_target_block = True
-                stock_block_lines = [line]
-                continue
-            elif in_target_block:
-                break
-        if in_target_block:
-            stock_block_lines.append(line)
+        interval_column_keys = [
+            "建议低吸买点区间", "买入挂单区间", "建议低吸买点", "低吸买点区间",
+            "建议买点区间", "买点区间", "挂单区间", "低吸区间", "买入区间", "建议买点",
+        ]
 
-    target_block_text = "\n".join(stock_block_lines) if stock_block_lines else section3_text
-
-    # 在定位的个股专属文本中匹配包含“买入挂单区间”或“建议低吸买点区间”的行
-    # 例如: | **买入挂单区间** | **¥9.40 — ¥9.48** |
-    m_row = re.search(
-        r"\|\s*(?:\*\*)?(?:买入|低吸|挂单).*?区间(?:\*\*)?\s*\|\s*([^\|\n]*\d[^\|\n]*?)\s*\|",
-        target_block_text,
-    )
-    if m_row:
-        raw_interval = m_row.group(1).strip()
-    else:
-        # 列表格式: - **买入挂单区间**：¥9.40 ~ ¥9.48
-        m_list = re.search(
-            r"(?:\*\*)?(?:买入|低吸|挂单).*?区间(?:\*\*)?[：:\s]+([^\n]*\d[^\n]*)",
-            target_block_text,
-        )
-        if m_list:
-            raw_interval = m_list.group(1).strip()
-
-    # 3. 策略 B：横向 Markdown 表格解析 (| 标的代码 | 标的名称 | ... | 建议低吸买点区间 | ...)
-    if not raw_interval:
-        tbl_lines = [l.strip() for l in section3_text.split("\n") if l.strip().startswith("|")]
-        header_idx = -1
-        interval_col_idx = -1
-        for idx, line in enumerate(tbl_lines):
-            cells = [c.strip() for c in line.split("|")[1:-1]]
-            for c_i, c in enumerate(cells):
-                if any(k in c for k in ["买入挂单区间", "建议低吸买点区间", "买点区间", "挂单区间", "买入区间", "低吸区间"]):
-                    header_idx = idx
-                    interval_col_idx = c_i
-                    break
-            if interval_col_idx != -1:
-                break
-
-        if interval_col_idx != -1:
-            for line in tbl_lines[header_idx + 1:]:
-                # 跳过对齐分割行 |:---|:---|
-                if set(line.replace("|", "").replace(":", "").replace("-", "").strip()) == set():
-                    continue
+        for tbl in tbl_blocks:
+            header_idx = -1
+            interval_col_idx = -1
+            for idx, line in enumerate(tbl):
                 cells = [c.strip() for c in line.split("|")[1:-1]]
-                if interval_col_idx < len(cells):
-                    row_text = " ".join(cells)
-                    # 优先匹配当前股票代码或名称所在的行，若都不在则取第1行数据
-                    if (code and code in row_text) or (name and name in row_text) or not raw_interval:
-                        raw_interval = cells[interval_col_idx]
+                for c_i, c in enumerate(cells):
+                    if any(k in c for k in interval_column_keys):
+                        header_idx = idx
+                        interval_col_idx = c_i
+                        break
+                if interval_col_idx != -1:
+                    break
+
+            if interval_col_idx != -1:
+                matched_row_interval = ""
+                first_data_interval = ""
+                for line in tbl[header_idx + 1:]:
+                    # 跳过对齐分割行 |:---|:---|
+                    if set(line.replace("|", "").replace(":", "").replace("-", "").strip()) == set():
+                        continue
+                    cells = [c.strip() for c in line.split("|")[1:-1]]
+                    if interval_col_idx < len(cells):
+                        val = cells[interval_col_idx].strip()
+                        if not first_data_interval and any(ch.isdigit() for ch in val):
+                            first_data_interval = val
+                        row_text = " ".join(cells)
                         if (code and code in row_text) or (name and name in row_text):
+                            matched_row_interval = val
                             break
+                if matched_row_interval:
+                    raw_interval = matched_row_interval
+                    break
+                elif first_data_interval and not raw_interval:
+                    raw_interval = first_data_interval
 
-    # 4. 策略 C：全局正则穿透匹配（兜底任意包含“挂单区间”或“低吸区间”的价格范围）
-    if not raw_interval:
-        m_general = re.search(
-            r"(?:买入|低吸|挂单).*?区间[^¥￥\d\n]*([¥￥]?\s*\d+(?:\.\d+)?\s*(?:[—\-\~到至]+|\.{2,})\s*[¥￥]?\s*\d+(?:\.\d+)?)",
-            section3_text,
-        )
-        if m_general:
-            raw_interval = m_general.group(1).strip()
+        # 2. 策略 B：查找个股专属段落或清单中的【建议低吸买点区间】
+        if not raw_interval:
+            pats = [
+                r"\|\s*(?:\*\*)?(?:建议低吸买点|买入挂单|低吸买点|买点).*?区间(?:\*\*)?\s*\|\s*([^\|\n]*\d[^\|\n]*?)\s*\|",
+                r"(?:\*\*)?(?:建议低吸买点|买入挂单|低吸买点|买点).*?区间(?:\*\*)?[：:\s]+([^\n]*\d[^\n]*)",
+            ]
+            for pat in pats:
+                m = re.search(pat, text)
+                if m:
+                    raw_interval = m.group(1).strip()
+                    break
 
-    # 5. 从区间字符串中提取【最高价位】
+        # 3. 策略 C：全局正则穿透匹配
+        if not raw_interval:
+            m_general = re.search(
+                r"(?:建议低吸买点|买入挂单|低吸|挂单).*?区间[^¥￥\d\n]*([¥￥]?\s*\d+(?:\.\d+)?\s*(?:[—\-\~到至~～]+|\.{2,})\s*[¥￥]?\s*\d+(?:\.\d+)?)",
+                text,
+            )
+            if m_general:
+                raw_interval = m_general.group(1).strip()
+
+    # 4. 从区间字符串中提取【最高值】
     if raw_interval:
         # 清除百分比 (如 +3.5%) 防止被当作价格
-        cleaned = re.sub(r"[+-]?\d+(?:\.\d+)?%", "", raw_interval)
+        cleaned = re.sub(r"[+-]?\s*\d+(?:\.\d+)?\s*%", "", raw_interval)
         # 清除 markdown 加粗及货币符号
         cleaned = cleaned.replace("**", "").replace("¥", "").replace("￥", "").strip()
         # 提取所有浮点数
@@ -244,12 +221,26 @@ def extract_buy_order_high_price(
                 valid_prices = [p for p in nums if 0.3 * default_price <= p <= 3.0 * default_price]
                 if valid_prices:
                     nums = valid_prices
-            high_price = round(max(nums), 2)
-            return (high_price, raw_interval)
+            if len(nums) >= 2:
+                # 明确取建议低吸买点区间的【最高值】
+                high_price = round(max(nums), 2)
+                return (high_price, raw_interval)
+            elif len(nums) == 1:
+                val = nums[0]
+                if default_price > 0 and abs(val - default_price) < 0.05:
+                    high_price = round(val * 1.002, 2)
+                else:
+                    high_price = round(val, 2)
+                return (high_price, raw_interval)
 
-    # 6. 回退至 default_price
-    fallback_p = round(float(default_price), 2) if default_price > 0 else 0.0
-    return (fallback_p, "")
+    # 5. 若未在文本中解析到区间，则以基准价（最新价/现价）的建议低吸买点区间最高值 (基准价 * 1.002) 兜底
+    if default_price > 0:
+        high_price = round(default_price * 1.002, 2)
+        low_price = round(default_price * 0.996, 2)
+        calc_interval = f"¥{low_price:.2f} ~ ¥{high_price:.2f} (算法推导最高值)"
+        return (high_price, calc_interval)
+
+    return (0.0, "")
 
 
 def extract_top_stock_from_state(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -331,26 +322,28 @@ def extract_top_stock_from_state(state: Dict[str, Any]) -> Optional[Dict[str, An
                 for s in qualified:
                     if str(s.get("code", "")).zfill(6) == matched_code:
                         res = dict(s)
+                        lp = float(res.get("latest_price", 0.0) or 0.0)
                         buy_price_high, raw_interval = extract_buy_order_high_price(
                             decision_text=decision_text,
                             stock_code=matched_code,
                             stock_name=res.get("name", ""),
-                            default_price=res.get("latest_price", 0.0),
+                            default_price=lp,
                         )
-                        res["buy_price"] = buy_price_high if buy_price_high > 0 else res.get("latest_price", 0.0)
+                        res["buy_price"] = buy_price_high if buy_price_high > 0 else (round(lp * 1.002, 2) if lp > 0 else 0.0)
                         res["buy_price_range"] = raw_interval
                         return res
                 for s in filtered:
                     s_code = str(s.get("code") or s.get("股票代码") or "").zfill(6)
                     if s_code == matched_code:
                         res = dict(s)
+                        lp = float(res.get("latest_price", 0.0) or 0.0)
                         buy_price_high, raw_interval = extract_buy_order_high_price(
                             decision_text=decision_text,
                             stock_code=matched_code,
                             stock_name=res.get("name") or res.get("股票简称", ""),
-                            default_price=res.get("latest_price", 0.0),
+                            default_price=lp,
                         )
-                        res["buy_price"] = buy_price_high if buy_price_high > 0 else res.get("latest_price", 0.0)
+                        res["buy_price"] = buy_price_high if buy_price_high > 0 else (round(lp * 1.002, 2) if lp > 0 else 0.0)
                         res["buy_price_range"] = raw_interval
                         return res
 
@@ -360,16 +353,15 @@ def extract_top_stock_from_state(state: Dict[str, Any]) -> Optional[Dict[str, An
         res = dict(top)
         c = res.get("code") or res.get("股票代码") or ""
         n = res.get("name") or res.get("股票简称") or ""
-        lp = res.get("latest_price") or res.get("price") or 0.0
+        lp = float(res.get("latest_price") or res.get("price") or 0.0)
         buy_price_high, raw_interval = extract_buy_order_high_price(
             decision_text=decision_text,
             stock_code=c,
             stock_name=n,
             default_price=lp,
         )
-        if buy_price_high > 0:
-            res["buy_price"] = buy_price_high
-            res["buy_price_range"] = raw_interval
+        res["buy_price"] = buy_price_high if buy_price_high > 0 else (round(lp * 1.002, 2) if lp > 0 else 0.0)
+        res["buy_price_range"] = raw_interval
         return res
     if top and isinstance(top, dict) and (top.get("code") or top.get("股票代码")):
         return top
@@ -525,18 +517,21 @@ def save_top_stock_from_state(state: Dict[str, Any]) -> Tuple[bool, str]:
     except (ValueError, TypeError):
         default_p = 0.0
 
-    # 核心：入库的买入价格字段取【三、🎯【日内操盘买卖点与精准挂单区间】】的【买入挂单区间】最高价位
+    # 核心：入库的买入价格字段取【建议低吸买点区间】的最高值
     buy_price_high, raw_interval = extract_buy_order_high_price(
         decision_text=decision_text,
         stock_code=code,
         stock_name=name,
         default_price=default_p,
     )
-    if buy_price_high <= 0 and top_stock.get("buy_price"):
-        try:
-            buy_price_high = float(top_stock["buy_price"])
-        except (ValueError, TypeError):
-            buy_price_high = default_p
+    if buy_price_high <= 0:
+        if top_stock.get("buy_price"):
+            try:
+                buy_price_high = float(top_stock["buy_price"])
+            except (ValueError, TypeError):
+                buy_price_high = round(default_p * 1.002, 2) if default_p > 0 else 0.0
+        elif default_p > 0:
+            buy_price_high = round(default_p * 1.002, 2)
     if not raw_interval and top_stock.get("buy_price_range"):
         raw_interval = top_stock.get("buy_price_range")
 
@@ -555,11 +550,10 @@ def save_top_stock_from_state(state: Dict[str, Any]) -> Tuple[bool, str]:
     print("💾 正在将策略选出的排名第一股票同步至 MySQL stock_recommendation 表...")
     print(f"🎯 [买入价格解析] 标的【{name}】({code}):")
     if raw_interval:
-        print(f"    - 来源板块: 三、🎯【日内操盘买卖点与精准挂单区间】")
-        print(f"    - 识别买入挂单区间: {raw_interval}")
-        print(f"    - 提取最高价位 (入库 buy_price): ¥{price:.2f}")
+        print(f"    - 识别建议低吸买点区间: {raw_interval}")
+        print(f"    - 建议低吸买点区间最高值 (入库 buy_price): ¥{price:.2f}")
     else:
-        print(f"    - 提取买入价格 (入库 buy_price): ¥{price:.2f}")
+        print(f"    - 建议低吸买点区间最高值 (入库 buy_price): ¥{price:.2f}")
     print("=" * 70)
     sys.stdout.flush()
 

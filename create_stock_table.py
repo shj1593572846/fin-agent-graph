@@ -2,7 +2,10 @@ import sys
 import pymysql
 
 if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 # 数据库连接配置
 DB_CONFIG = {

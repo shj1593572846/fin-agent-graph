@@ -13,9 +13,15 @@ if _PROJECT_ROOT not in sys.path:
 
 # 适配 Windows 控制台编码，防止 Emoji 及中文字符输出异常
 if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 from langchain_core.messages import HumanMessage
 from graph import build_multi_agent_graph

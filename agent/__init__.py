@@ -16,9 +16,13 @@ if _PROJECT_ROOT not in sys.path:
 from .state import ResearchState
 from .graph import build_multi_agent_graph
 from .main import run_research_pipeline
+from .user_memory import load_user_memory, save_user_memory, get_user_role
 
 __all__ = [
     "ResearchState",
     "build_multi_agent_graph",
     "run_research_pipeline",
+    "load_user_memory",
+    "save_user_memory",
+    "get_user_role",
 ]

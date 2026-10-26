@@ -8,6 +8,7 @@ from typing import List, Dict, Any, Optional
 import chromadb
 from chromadb.config import Settings
 from rag.config import CHROMA_DIR, COLLECTION_NAME
+from rag.hybrid_search import BM25Index, reciprocal_rank_fusion
 
 
 class FinancialVectorStore:
@@ -36,6 +37,37 @@ class FinancialVectorStore:
             name=COLLECTION_NAME,
             metadata={"description": "Financial research reports & financial statements RAG store"}
         )
+        self.bm25_index = BM25Index()
+        self._bm25_initialized = False
+
+    def _ensure_bm25_index(self):
+        """按需初始化/增量构建内存 BM25 稀疏索引"""
+        if self._bm25_initialized:
+            return
+        try:
+            res = self.collection.get(include=["documents", "metadatas"])
+            chunks = []
+            if res and "ids" in res:
+                docs = res.get("documents", [])
+                metas = res.get("metadatas", [])
+                for i, cid in enumerate(res["ids"]):
+                    doc_text = docs[i] if i < len(docs) else ""
+                    meta = metas[i] if i < len(metas) and metas[i] else {}
+                    chunks.append({
+                        "chunk_id": cid,
+                        "text": doc_text,
+                        "title": meta.get("title", ""),
+                        "stock_name": meta.get("stock_name", ""),
+                        "stock_code": meta.get("stock_code", ""),
+                        "category": meta.get("category", ""),
+                        "doc_id": meta.get("doc_id", ""),
+                        "page": meta.get("page", 1),
+                        "chunk_index": meta.get("chunk_index", 0),
+                    })
+            self.bm25_index.fit(chunks)
+            self._bm25_initialized = True
+        except Exception as e:
+            print(f"⚠️ [VectorStore] 构建 BM25 索引异常: {e}")
 
     def add_chunks(self, chunks: List[Dict[str, Any]]) -> int:
         """
@@ -76,12 +108,15 @@ class FinancialVectorStore:
             )
             total_added += len(b_ids)
 
+        # 数据发生变更，重置 BM25 索引
+        self._bm25_initialized = False
         return total_added
 
     def delete_by_doc_id(self, doc_id: str) -> bool:
         """根据文档 ID 删除其在 Chroma 中的所有分块"""
         try:
             self.collection.delete(where={"doc_id": doc_id})
+            self._bm25_initialized = False
             return True
         except Exception as e:
             print(f"⚠️ [VectorStore] 删除 doc_id={doc_id} 向量失败: {e}")
@@ -163,9 +198,87 @@ class FinancialVectorStore:
                     "stock_name": meta.get("stock_name", ""),
                     "page": meta.get("page", 1),
                     "chunk_index": meta.get("chunk_index", 0),
+                    "retrieval_method": "vector_similarity",
                 })
 
         return results
+
+    def query_bm25(
+        self,
+        query_text: str,
+        n_results: int = 5,
+        category: Optional[str] = None,
+        stock_code: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        按 BM25 稀疏关键词字面匹配度检索 top_k 个相关分块
+        对股票代码、专有指标与公司全称具备极高精度的字面捕捉力
+        """
+        if not query_text.strip():
+            return []
+        self._ensure_bm25_index()
+        cat = category if category and category != "全部" else None
+        return self.bm25_index.search(
+            query=query_text,
+            n_results=n_results,
+            stock_code_filter=stock_code,
+            category_filter=cat,
+        )
+
+    def query_hybrid(
+        self,
+        query_text: str,
+        n_results: int = 5,
+        category: Optional[str] = None,
+        stock_code: Optional[str] = None,
+        w_dense: float = 0.5,
+        w_sparse: float = 0.5,
+    ) -> List[Dict[str, Any]]:
+        """
+        混合检索核心方法：
+        1. 稠密向量语义检索 (Dense Vector Search) 召回多倍语义关联候选集；
+        2. 稀疏 BM25 关键词检索 (Sparse BM25 Search) 召回字面/专有词精确命中候选集；
+        3. 倒数排名融合算法 (Reciprocal Rank Fusion, RRF) 消除两路打分分布偏差并综合重排。
+        """
+        if not query_text.strip():
+            return []
+
+        total_count = self.collection.count()
+        if total_count == 0:
+            return []
+
+        # 多路候选召回：两路各召回 2~3 倍候选切片送入 RRF 融合重排
+        candidate_n = min(total_count, max(n_results * 2, 8))
+
+        dense_results = self.query_similarity(
+            query_text=query_text,
+            n_results=candidate_n,
+            category=category,
+            stock_code=stock_code,
+        )
+
+        sparse_results = self.query_bm25(
+            query_text=query_text,
+            n_results=candidate_n,
+            category=category,
+            stock_code=stock_code,
+        )
+
+        # 单边无召回时的优雅降级
+        if not sparse_results:
+            return dense_results[:n_results]
+        if not dense_results:
+            return sparse_results[:n_results]
+
+        # 倒数排名融合 (RRF)
+        return reciprocal_rank_fusion(
+            dense_results=dense_results,
+            sparse_results=sparse_results,
+            top_k=n_results,
+            rrf_k=60,
+            w_dense=w_dense,
+            w_sparse=w_sparse,
+        )
 
     def count(self) -> int:
         """获取当前集合中分块总数"""

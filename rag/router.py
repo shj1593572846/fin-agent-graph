@@ -9,6 +9,7 @@ from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from pydantic import BaseModel
 
 from rag.rag_service import rag_service
+from rag.skill import financial_rag_skill
 from rag.config import CATEGORY_RESEARCH, CATEGORY_FINANCIAL
 
 router = APIRouter(prefix="/api/rag", tags=["RAG 研报财报知识库"])
@@ -20,6 +21,9 @@ class RAGQueryRequest(BaseModel):
     stock_code: Optional[str] = None
     top_k: int = 4
     generate_answer: bool = True
+    session_id: Optional[str] = "default"
+    use_memory: Optional[bool] = True
+    search_mode: Optional[str] = "hybrid"
 
 
 @router.get("/stats")
@@ -30,6 +34,57 @@ async def get_rag_stats():
         return {"success": True, "data": stats}
     except Exception as e:
         return {"success": False, "error": str(e), "data": {}}
+
+
+@router.get("/skill")
+async def get_rag_skill_info():
+    """获取金融研报与财报问答 Skill 的自描述元数据及出入参契约"""
+    try:
+        return {"success": True, "data": financial_rag_skill.get_metadata()}
+    except Exception as e:
+        return {"success": False, "error": str(e), "data": {}}
+
+
+@router.post("/skill/reload")
+async def reload_rag_skill():
+    """从 SKILL.md 文件热重载 Agent 人设与提示词配置"""
+    try:
+        ok = financial_rag_skill.reload()
+        return {
+            "success": ok,
+            "message": "已成功从 SKILL.md 重新装载 Agent 设定与提示词！",
+            "data": financial_rag_skill.get_metadata(),
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@router.get("/memory")
+async def get_rag_memory(session_id: str = "default"):
+    """获取指定会话在滑动窗口中的全部对话历史与记忆统计"""
+    try:
+        turns = financial_rag_skill.get_memory_turns(session_id)
+        stats = financial_rag_skill.get_memory_stats()
+        return {
+            "success": True,
+            "session_id": session_id,
+            "data": turns,
+            "count": len(turns),
+            "stats": stats,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e), "data": [], "count": 0}
+
+
+@router.delete("/memory")
+async def clear_rag_memory(session_id: Optional[str] = None):
+    """清空指定会话或全部滑动窗口记忆"""
+    try:
+        financial_rag_skill.clear_memory(session_id)
+        msg = f"会话 '{session_id}' 滑动窗口记忆已成功清空！" if session_id else "全部会话滑动窗口记忆已成功清空！"
+        return {"success": True, "message": msg}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 @router.get("/documents")
@@ -151,6 +206,9 @@ async def query_knowledge_base(req: RAGQueryRequest):
             stock_code=req.stock_code,
             top_k=req.top_k,
             generate_answer=req.generate_answer,
+            session_id=req.session_id or "default",
+            use_memory=req.use_memory if req.use_memory is not None else True,
+            search_mode=req.search_mode or "hybrid",
         )
         return {"success": True, "data": res}
     except Exception as e:

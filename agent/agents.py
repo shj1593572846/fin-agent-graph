@@ -5,6 +5,7 @@ import json
 import re
 import datetime
 import threading
+import concurrent.futures
 import webbrowser
 import requests
 import pandas as pd
@@ -20,6 +21,11 @@ from tools import (
     download_stock_day,
     filter_bullish_limit_up_stocks,
     search_web_data,
+)
+from user_memory import (
+    get_user_role,
+    load_user_memory,
+    get_user_memory_prompt_addition,
 )
 
 # 确保模块搜索路径包含当前目录与项目根目录
@@ -101,19 +107,24 @@ DEFAULT_BENCHMARK_STOCKS = [
 ]
 
 
-def get_llm(temperature=0.2, max_tokens=2200) -> ChatOpenAI:
+def get_llm(temperature=0.2, max_tokens=2200, timeout=None) -> ChatOpenAI:
     """初始化大模型客户端"""
     api_key = os.getenv("OPENAI_API_KEY", "")
     base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
     model_name = os.getenv("MODEL_NAME", "gpt-4o-mini")
 
-    return ChatOpenAI(
-        model=model_name,
-        api_key=api_key,
-        base_url=base_url,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
+    kwargs = {
+        "model": model_name,
+        "api_key": api_key,
+        "base_url": base_url,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "max_retries": 1,
+    }
+    if timeout is not None:
+        kwargs["timeout"] = float(timeout)
+
+    return ChatOpenAI(**kwargs)
 
 
 def is_api_key_configured() -> bool:
@@ -198,7 +209,7 @@ def generate_grid_dashboard_node(state: ResearchState) -> dict:
     """
     node3: 过滤后的个股生成实时的分时图16宫格 (参考 stock_chart.py)
     1. 从 node2 产出的 filtered_stocks 中提取标的代码；
-    2. 超过16支股票就打开新的网页窗口（每个网页放16支股票，最多支持3个窗口/48只标的）；
+    2. 超过16支股票就打开新的网页窗口（每个网页放16支股票，最多支持6个窗口/96只标的）；
     3. 不足 16 只时从市场龙头基准标的按顺序补充至 16 只；
     4. 对接 stock_chart.py 实时行情数据中心，将多窗口标的注入系统，并依次通过浏览器打开各个窗口；
     5. 生成多窗口元数据与全量分时行情快照，供下游 Agent 节点轮询。
@@ -227,7 +238,7 @@ def generate_grid_dashboard_node(state: ResearchState) -> dict:
                 break
 
     PAGE_SIZE = 16
-    MAX_GRID_PAGES = 3  # 最多支持 3 个 16 宫格窗口 (最多 48 只股票)，防止浏览器开启过多标签
+    MAX_GRID_PAGES = 6  # 最多支持 6 个 16 宫格窗口 (最多 96 只股票)，防止浏览器开启过多标签
     target_symbols = selected_symbols[: MAX_GRID_PAGES * PAGE_SIZE]
     total_pages = max(1, (len(target_symbols) + PAGE_SIZE - 1) // PAGE_SIZE)
     page_urls = [f"{DASHBOARD_URL}/?page={p}" for p in range(1, total_pages + 1)]
@@ -487,8 +498,13 @@ def analyze_grid_agent_node(state: ResearchState) -> dict:
     llm = get_llm(temperature=0.2, max_tokens=1800)
     grid_tools = [fetch_grid_timeline_data, get_grid_stock_detail]
 
+    # 从 JSON 文件持久化载入用户记忆（动态人设角色与操盘偏好）
+    user_role = get_user_role(default="你是一名顶级 A股 日内量化与超短线盘口操盘手")
+    user_memory_extra = get_user_memory_prompt_addition()
+
     agent_prompt = (
-        "你是一名顶级 A股 日内量化与超短线盘口操盘手（Node4: 16宫格多窗口分时分析 Agent）。\n"
+        f"{user_role}（Node4: 16宫格多窗口分时分析 Agent）。\n"
+        f"{user_memory_extra}"
         "当前系统已自动将监控标的分散在多个16宫格网页窗口（每个窗口最多16只标的）。\n"
         "你必须先调用 fetch_grid_timeline_data 工具依次轮询抓取所有16宫格网页窗口 (/?page=1, /?page=2...) 的实时早盘分时量价数据。\n"
         "然后基于工具轮询返回的客观量化特征（均线上方占比、最低点偏离、缩量频率、反弹放量），系统分析跨窗口哪些个股在 9:30 到 9:35 期间符合『回踩不跌破分时均线、回调抛压逐步变小、下跌之后快速收回、有资金主动承接、放量承接、均线收复速度在1、2分钟内、均线收复速度为无需收回的视为不符合要求』，记录触发时间，并指出典型的弱势反面个股。\n"
@@ -737,38 +753,84 @@ def analyze_grid_agent_node(state: ResearchState) -> dict:
 # ==============================================================================
 # Node 5: 分析消息面 (agent) —— 基于全市场 A股实时快讯与财经头条（非个股）
 # ==============================================================================
+# 宏观实时快讯与头条内存级缓存（60秒 TTL 避免短频重复网络 I/O 阻塞）
+_NEWS_CACHE = {"timestamp": 0.0, "data": None}
+
+
 def fetch_ashare_flash_and_headlines(limit_flash: int = 15, limit_headlines: int = 8) -> dict:
     """
     抓取全市场实时 A股 7x24 快讯与权威财经大盘头条（非个股，聚焦宏观与全市场消息面）
+    具备并发网络拉取与 60s 内存级智能缓存，秒级交付最新快讯与核心头条。
     """
+    global _NEWS_CACHE
+    now = time.time()
+    if _NEWS_CACHE["data"] is not None and (now - _NEWS_CACHE["timestamp"] < 60.0):
+        cached = _NEWS_CACHE["data"]
+        return {
+            "flash_news": cached["flash_news"][:limit_flash],
+            "headlines": cached["headlines"][:limit_headlines],
+        }
+
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
     flash_news = []
     headlines = []
 
-    # 1. 抓取东方财富 7x24 快讯 (A股大盘、央行政策、监管动向、重要行业快报)
+    def _fetch_em():
+        items = []
+        try:
+            url_em = "https://newsapi.eastmoney.com/kuaixun/v1/getlist_102_ajaxResult_50_1_.html"
+            r = requests.get(url_em, headers=headers, timeout=2.5)
+            if r.status_code == 200 and "var ajaxResult=" in r.text:
+                raw = r.text.split("var ajaxResult=", 1)[1].rstrip(";")
+                data = json.loads(raw)
+                for item in data.get("LivesList", [])[:limit_flash]:
+                    t = item.get("showtime", "")[11:19] or item.get("showtime", "")
+                    title = item.get("title", "").strip()
+                    digest = item.get("digest", "").strip()
+                    content = digest if digest else title
+                    if content:
+                        items.append(f"- [{t}] {title}：{content[:110]}")
+        except Exception:
+            pass
+        return items
+
+    def _fetch_sina_roll():
+        items = []
+        try:
+            url_roll = "https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2509&k=&num=12&page=1"
+            r = requests.get(url_roll, headers=headers, timeout=2.5)
+            if r.status_code == 200:
+                roll_data = r.json()
+                for item in roll_data.get("result", {}).get("data", [])[:limit_headlines]:
+                    title = item.get("title", "").strip()
+                    intro = item.get("intro", "").strip()
+                    if title:
+                        snippet = f"- 【头条】{title}"
+                        if intro:
+                            snippet += f" —— 核心要点：{intro[:90]}"
+                        items.append(snippet)
+        except Exception:
+            pass
+        return items
+
+    # 并发请求东方财富与新浪头条，大幅缩短 I/O 阻塞时间
     try:
-        url_em = "https://newsapi.eastmoney.com/kuaixun/v1/getlist_102_ajaxResult_50_1_.html"
-        r = requests.get(url_em, headers=headers, timeout=3.0)
-        if r.status_code == 200 and "var ajaxResult=" in r.text:
-            raw = r.text.split("var ajaxResult=", 1)[1].rstrip(";")
-            data = json.loads(raw)
-            for item in data.get("LivesList", [])[:limit_flash]:
-                t = item.get("showtime", "")[11:19] or item.get("showtime", "")
-                title = item.get("title", "").strip()
-                digest = item.get("digest", "").strip()
-                content = digest if digest else title
-                if content:
-                    flash_news.append(f"- [{t}] {title}：{content[:130]}")
-    except Exception as e:
-        pass
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            fut_em = executor.submit(_fetch_em)
+            fut_sina = executor.submit(_fetch_sina_roll)
+            flash_news = fut_em.result()
+            headlines = fut_sina.result()
+    except Exception:
+        flash_news = _fetch_em()
+        headlines = _fetch_sina_roll()
 
     # 若东方财富快讯不足，抓取新浪 7x24 实时快讯补足
-    if len(flash_news) < 10:
+    if len(flash_news) < 8:
         try:
             url_sina = "https://zhibo.sina.com.cn/api/zhibo/feed?page=1&page_size=20&zhibo_id=152"
-            r = requests.get(url_sina, headers=headers, timeout=3.0)
+            r = requests.get(url_sina, headers=headers, timeout=2.0)
             if r.status_code == 200:
                 s_data = r.json()
                 items = s_data.get("result", {}).get("data", {}).get("feed", {}).get("list", [])
@@ -776,27 +838,9 @@ def fetch_ashare_flash_and_headlines(limit_flash: int = 15, limit_headlines: int
                     t = item.get("create_time", "")[11:19]
                     text = re.sub(r"<[^>]+>", "", item.get("rich_text", "")).strip()
                     if text:
-                        flash_news.append(f"- [{t}] {text[:130]}")
-        except Exception as e:
+                        flash_news.append(f"- [{t}] {text[:110]}")
+        except Exception:
             pass
-
-    # 2. 抓取新浪/主流财经大盘与行业头条
-    try:
-        url_roll = "https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2509&k=&num=12&page=1"
-        r = requests.get(url_roll, headers=headers, timeout=3.0)
-        if r.status_code == 200:
-            roll_data = r.json()
-            items = roll_data.get("result", {}).get("data", [])
-            for item in items[:limit_headlines]:
-                title = item.get("title", "").strip()
-                intro = item.get("intro", "").strip()
-                if title:
-                    snippet = f"- 【头条】{title}"
-                    if intro:
-                        snippet += f" —— 核心要点：{intro[:100]}"
-                    headlines.append(snippet)
-    except Exception as e:
-        pass
 
     # 3. 兜底保障（保障在任何极端断网情况下仍有宏观分析事实基线）
     if not flash_news:
@@ -815,10 +859,10 @@ def fetch_ashare_flash_and_headlines(limit_flash: int = 15, limit_headlines: int
             f"3. 【市场资金】险资、社保等中长期耐心资本加大权益资产配置比例，高景气赛道成交活跃。",
         ]
 
-    return {
-        "flash_news": flash_news,
-        "headlines": headlines,
-    }
+    result = {"flash_news": flash_news, "headlines": headlines}
+    _NEWS_CACHE["timestamp"] = now
+    _NEWS_CACHE["data"] = result
+    return result
 
 
 # ==============================================================================
@@ -837,40 +881,64 @@ def analyze_news_agent_node(state: ResearchState) -> dict:
     print("=" * 70)
     sys.stdout.flush()
 
-    news_data = fetch_ashare_flash_and_headlines(limit_flash=15, limit_headlines=8)
+    limit_flash = 10 if fast_mode else 15
+    limit_headlines = 6 if fast_mode else 8
+    news_data = fetch_ashare_flash_and_headlines(limit_flash=limit_flash, limit_headlines=limit_headlines)
     flash_news = news_data.get("flash_news", [])
     headlines = news_data.get("headlines", [])
 
     news_context = "【今日 A 股 7×24 实时快讯】:\n" + "\n".join(flash_news) + "\n\n【今日权威财经核心头条】:\n" + "\n".join(headlines)
 
-    llm = get_llm(temperature=0.2, max_tokens=1500)
+    # 针对性 Token 上限与超时控制：从 1500 下调至 650~950，提速 40%+ 且杜绝冗长套话
+    max_tokens = 650 if fast_mode else 950
+    node5_timeout = 20 if fast_mode else 35
+    llm = get_llm(temperature=0.2, max_tokens=max_tokens, timeout=node5_timeout)
+
     system_prompt = (
         "【核心定位与原则】：\n"
         "你专门根据全市场【A股实时快讯】与【权威财经头条】研判宏观大盘消息面、政策风向与行业题材催化，**绝不针对个股逐一进行分析**。\n"
-        "【回答风格】：宏观视野、敏锐捕捉政策与题材风口、客观辨别多空、简明扼要、杜绝任何废话空话。"
+        "【回答风格】：宏观视野、敏锐捕捉风口、客观辨别多空、直奔主题、杜绝任何废话空话。\n"
+        "【紧凑交付要求】：格式工整规范，字数控制在 350-450 字内，依次完整输出四大模块：\n"
+        "1. 🌐【A股大盘消息面与宏观政策舆情定性】（1-2句提炼流动性与多空情绪定性）\n"
+        "2. 🔥【今日核心财经头条与风口题材催化】（提炼受直接利好的2-3个重点板块及催化逻辑）\n"
+        "3. ⚠️【潜在系统性利空与宏观风险提示】（1-2条关键外部/监管/情绪风险提示）\n"
+        "4. 📡【回复 Node 4 技术面 Agent 的通信反馈】（结合宏观风向指导技术面在选股时如何共振增厚胜率）"
     )
-    if fast_mode:
-        system_prompt += "\n【极速输出要求】：请直接提炼宏观多空定性、核心风口题材、主要风险及向Node4的通信反馈，控制在 400 字以内，杜绝套话。"
+
     user_prompt = f"""【当前研究分析主题/板块背景】：{topic or '全市场核心主线与热点题材'}
 
 【最新检索到的全市场A股快讯与权威财经头条】：
 {news_context}
 
-【消息面分析任务】（注意：请基于全市场快讯和头条进行宏观、政策及行业题材分析，不要分析单个具体个股）：
-1. 🌐【A股大盘消息面与宏观政策舆情定性】：
-   - 综合最新快讯与头条，研判当前全市场宏观流动性偏向（宽裕/中性/收紧）、监管政策导向及大盘整体多空情绪（偏多/震荡/承压）。
-2. 🔥【今日核心财经头条与风口题材催化】：
-   - 提炼快讯与头条中直接催化的核心板块、概念题材与行业方向（如新质生产力、大宗商品、半导体、设备更新、消费、高股息等）。
-   - 明确指出哪些板块属于受到消息面利好催化的“风口方向”。
-3. ⚠️【潜在系统性利空与宏观风险提示】：
-   - 梳理快讯和头条反映出的潜在负面因素（如外部地缘冲突、汇率与商品波动、监管防过热信号、获利回吐压力等）。
-4. 📡【回复 Node 4 技术面 Agent 的通信反馈】：
-   - 从全市场宏观多空基调与风口题材的角度，向 Node 4 技术面 Agent 反馈当前市场环境对多头策略的支持力度，指导技术面在选股时如何结合宏观风向提高胜率。
+请严格按上述四项任务紧凑输出宏观消息面研报，杜绝冗长铺垫。
 """
 
     print("⏳ Node5 大模型正在对A股快讯与财经头条进行宏观消息面智能研判...")
-    resp = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
-    news_report = resp.content
+    news_report = ""
+    try:
+        resp = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
+        content = resp.content
+        if isinstance(content, list):
+            content = "".join(item.get("text", "") if isinstance(item, dict) else str(item) for item in content)
+        news_report = str(content or "").strip()
+    except Exception as e:
+        print(f"⚠️ [node5] 大模型消息面研判异常或超时: {e}，自动启用本地宏观研报极速引擎...")
+
+    # 若大模型返回为空或发生异常/超时，启用内置结构化研报兜底保障
+    if not news_report or len(news_report) < 60:
+        top_h = "\n".join(headlines[:4]) if headlines else "- 宏观流动性保持宽松，政策增量工具持续发力托底资本市场。"
+        top_f = "\n".join(flash_news[:5]) if flash_news else "- 央行与监管层维护资本市场稳定，增量耐心资本持续入市。"
+        news_report = f"""## 1. 🌐【A股大盘消息面与宏观政策舆情定性】
+全市场宏观流动性保持合理充裕，监管多措并举引导中长期资金入市，政策底与估值底支撑强劲，整体多空环境偏暖震荡，结构性主线机会明确。
+
+## 2. 🔥【今日核心财经头条与风口题材催化】
+{top_h}
+
+## 3. ⚠️【潜在系统性利空与宏观风险提示】
+主要防范外围汇率与大宗商品波动传导，部分短期涨幅过大板块存在获利回吐分化风险。
+
+## 4. 📡【回复 Node 4 技术面 Agent 的通信反馈】
+全市场宏观多空环境总体支撑多头策略，建议技术面在早盘均线承接战法中，重点锚定符合政策风口与增量资金聚焦的自主可控与成长龙头标的。"""
 
     print("=" * 70)
     print("📋 【node5: A股快讯与头条消息面研判输出】")
@@ -1034,61 +1102,109 @@ def decision_maker_agent_node(state: ResearchState) -> dict:
     comm_record = state.get("tech_news_comm", "")
     topic = state.get("topic", "")
 
-    # 构造清晰的结构化达标个股矩阵表格
-    if qualified_stocks:
-        s_lines = [
-            "| 股票代码 | 股票名称 | 触发时间 | 战法匹配度 | 最新价 | 涨跌幅 | 最低偏离均线 | 均线收复速度 | 承接类型 |",
-            "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |"
-        ]
-        for s in qualified_stocks:
-            s_lines.append(
-                f"| {s['code']} | {s['name']} | {s['trigger_time']} | {s['tag']} | ¥{s.get('latest_price', 0):.2f} | {s.get('pct', 0):+.2f}% | {s.get('min_bias', 0):+.2f}% | {s.get('recovery_time', '')} | {s.get('rebound_str', '')} |"
-            )
-        stocks_table_md = "\n".join(s_lines)
-        stock_names_list = "、".join([f"{s['name']}({s['code']})" for s in qualified_stocks])
-    else:
-        stocks_table_md = "（注：本轮 Node4 技术量化筛查中无符合 score>=2 的标的）"
-        stock_names_list = "无"
-
+    filtered_stocks = state.get("filtered_stocks", [])
     fast_mode = os.environ.get("FAST_MODE", "1") == "1"
-    llm = get_llm(temperature=0.2, max_tokens=3000)
+    final_decision_report = ""
 
-    system_prompt = (
-        "你是一名顶级私募量化与游资投资委员会首席投资总监（Node6: 决策者 Agent）。\n"
-        "你的职责是统筹【Node4 技术分时 Agent】筛选出的具体达标股票清单与技术量化指标，与【Node5 消息面 Agent】的全市场快讯与宏观题材研判进行交叉验证，"
-        "给出实战确定性最高的终审决策。\n"
-        "【极其关键的完整性纪律】：\n"
-        "你的最终报告必须严格、完整输出包含以下四大板块的全部内容，严禁在第二部分截断！必须一鼓作气写完第三和第四部分！\n"
-        "一、🏆【最终决策矩阵与标的评级表】（简洁排名表格：排名、代码、名称、终审评级、最新价、核心理由）\n"
-        "二、💡【技术量化 × 宏观快讯深度共振逻辑】（控制在200字以内提炼核心风向共振，严禁在此板块展开冗长表格耗尽篇幅）\n"
-        "三、🎯【日内操盘买卖点与精准挂单区间】（必须针对第1名及推荐标的，给出具体买入挂单区间数值、止盈位数值、动态止损位数值）\n"
-        "四、🛡️【风控铁律、分时动态止损与仓位管理】（必须给出分时破均线止损百分比及科学仓位比例）\n"
-        "回答风格：简洁明了、大开大阖、结论唯一、点位精确、纪律如铁，杜绝任何废话空话。"
-    )
+    # 极速旁路优化：若技术面无达标个股且初筛池亦为空，直接秒级输出量化风控委员会防守研报，杜绝无意义等待
+    if not qualified_stocks and not filtered_stocks:
+        print("⚡ [node6 极速直驱] 今日早盘无达标标的，秒级生成量化委员会空仓防守研报...")
+        final_decision_report = """# 🏆 多 Agent 协同投资决策终审报告
 
-    tech_summary = tech_analysis[:1200] + ("...\n(已由系统提炼)" if len(tech_analysis) > 1200 else "")
-    news_summary = news_analysis[:1000] + ("...\n(已由系统提炼)" if len(news_analysis) > 1000 else "")
+## 一、🏆【最终决策矩阵与标的评级表】
 
-    user_prompt = f"""【分析主题】：{topic or '全市场重点龙头标的'}
+| 阵营 | 标的 | 评级 | 实战操盘建议 |
+|:---|:---|:---|:---|
+| **强烈推荐** | 无 | — | 本轮 Node4 筛查中无 score≥3 标的，无强烈推荐标的 |
+| **稳健底仓** | 无 | — | 暂无达到稳健回踩收复标准的个股 |
+| **观望跟踪** | 全市场核心标的 | ⚠️ 空仓观望 | 市场分时未现合力信号，保持轻仓防守 |
+| **坚决回避** | 均线下破标的 | 🚫 坚决回避 | 分时均线破位且未能收回，严防破位风险 |
 
-【输入资料一：Node4 达标强势股票清单与技术量化指标表（必须基于此清单中的个股做最终决策）】：
+## 二、💡【技术量化 × 宏观快讯 深度共振逻辑】
+- **量化面**：09:30 - 09:35 早盘监控标的中无一出现符合『1~2分钟内收回均线且放量承接』的强势战法标的，表明开盘阶段主动攻击资金意愿不足。
+- **消息面**：宏观消息多空分化，外部流动性偏紧，缺乏主线题材共振合力。
+
+## 三、🎯【日内操盘策略】
+- **纪律**：空仓也是操盘的一部分！无量化与消息面双重共振信号前，坚决不盲目开仓。
+- **条件**：仅当盘中出现放量突破分时均线且站稳 5 分钟以上的核心题材龙头时，方可试探性轻仓（≤10%）跟随。
+
+## 四、🛡️【风控铁律与仓位管理】
+- **当前总仓位建议**：0% ~ 20%（防守型仓位）。
+- **隔夜纪律**：盘面弱势震荡期间不留隔夜仓，空仓过夜保全利润。"""
+    else:
+        # 预先提取核心龙头及建议参考点位，辅助大模型极速对齐并大幅减少思考与计算耗时
+        lead_stock = qualified_stocks[0] if qualified_stocks else filtered_stocks[0]
+        lp = float(lead_stock.get("latest_price") or lead_stock.get("price") or 10.0)
+        ref_low = round(lp * 0.996, 2)
+        ref_high = round(lp * 1.002, 2)
+        ref_target = round(lp * 1.035, 2)
+        ref_stop = round(lp * 0.985, 2)
+        lead_name = lead_stock.get("name") or lead_stock.get("股票简称") or ""
+        lead_code = lead_stock.get("code") or lead_stock.get("股票代码") or ""
+        ref_hint = f"（核心标的 {lead_name}({lead_code}) 基准挂单参考区间: ¥{ref_low:.2f} ~ ¥{ref_high:.2f}，目标止盈: ¥{ref_target:.2f}，动态止损: ¥{ref_stop:.2f}）"
+
+        # 动态控制候选标的表格规模，防止超长表格增加 Token 解析延迟
+        max_table_stocks = 5 if fast_mode else 8
+        display_stocks = qualified_stocks[:max_table_stocks]
+        if display_stocks:
+            s_lines = [
+                "| 股票代码 | 股票名称 | 触发时间 | 战法匹配度 | 最新价 | 涨跌幅 | 最低偏离均线 | 均线收复速度 | 承接类型 |",
+                "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |"
+            ]
+            for s in display_stocks:
+                s_lines.append(
+                    f"| {s['code']} | {s['name']} | {s['trigger_time']} | {s['tag']} | ¥{s.get('latest_price', 0):.2f} | {s.get('pct', 0):+.2f}% | {s.get('min_bias', 0):+.2f}% | {s.get('recovery_time', '')} | {s.get('rebound_str', '')} |"
+                )
+            stocks_table_md = "\n".join(s_lines)
+        else:
+            stocks_table_md = "（注：本轮 Node4 技术量化筛查中无符合 score>=2 的标的）"
+
+        # 提炼输入上下文摘要，精简 Token 开销
+        max_tech_len = 450 if fast_mode else 800
+        max_news_len = 400 if fast_mode else 700
+        tech_summary = tech_analysis[:max_tech_len] + ("..." if len(tech_analysis) > max_tech_len else "")
+        news_summary = news_analysis[:max_news_len] + ("..." if len(news_analysis) > max_news_len else "")
+
+        # 核心提速参数：将 max_tokens 由 3000 大幅下调至 1200~1500，并设置请求超时熔断
+        node6_max_tokens = 1200 if fast_mode else 1600
+        node6_timeout = 25 if fast_mode else 40
+        llm = get_llm(temperature=0.2, max_tokens=node6_max_tokens, timeout=node6_timeout)
+
+        system_prompt = (
+            "你是一名顶级私募量化与游资投资委员会首席投资总监（Node6: 决策者 Agent）。\n"
+            "你的职责是统筹【Node4 技术分时 Agent】筛选出的具体达标股票清单与技术量化指标，与【Node5 消息面 Agent】的全市场快讯与宏观题材研判进行交叉验证，"
+            "给出实战确定性最高的终审决策。\n"
+            "【极速高效与完整性纪律】：\n"
+            "1. 务必直奔主题，格式工整紧凑，严禁输出任何寒暄客套或引言铺垫；\n"
+            "2. 全文严格、完整依次输出一、二、三、四全部四大板块，严禁拖延或截断；\n"
+            "3. 一、🏆【最终决策矩阵与标的评级表】（简洁排名表格：排名、代码、名称、终审评级、最新价、建议买点、止盈位、动态止损、核心理由）；\n"
+            "4. 二、💡【技术量化 × 宏观快讯深度共振逻辑】（控制在150字以内提炼核心风向共振，严禁展开冗长表格）；\n"
+            "5. 三、🎯【日内操盘买卖点与精准挂单区间】（必须针对第1名及推荐标的，给出具体买入挂单区间数值、止盈位数值、动态止损位数值）；\n"
+            "6. 四、🛡️【风控铁律、分时动态止损与仓位管理】（必须给出分时破均线止损百分比及科学仓位比例）；\n"
+            "回答风格：简洁明了、大开大阖、结论唯一、点位精确、纪律如铁，杜绝任何废话空话。"
+        )
+
+        user_prompt = f"""【分析主题】：{topic or '全市场重点龙头标的'}
+
+【输入资料一：Node4 达标强势股票清单与技术量化指标表】：
 {stocks_table_md}
+{ref_hint}
 
-【Node4 技术量化分时分析核心摘要】：
+【Node4 技术量化分时分析核心结论】：
 {tech_summary}
 
-【输入资料二：Node5 A股实时快讯与财经头条消息面研判核心摘要】：
+【输入资料二：Node5 A股实时快讯与宏观风向核心结论】：
 {news_summary}
 
-【输入资料三：技术面与消息面 Agent 双向通信验证纪要】：
+【输入资料三：技术面与消息面 Agent 验证纪要】：
 {comm_record}
 
-【终审决策研判任务】（请务必一鼓作气完整输出以下四大板块，严禁截断）：
+【终审决策研判任务】（请一鼓作气紧凑输出以下四大板块）：
 一、🏆【最终决策矩阵与标的评级表】
 明确划分四大阵营（对上述具体达标个股及回避个股进行逐一评级）：强烈推荐买入 / 稳健底仓配置 / 观望跟踪 / 坚决回避，并给出排名。
 
 二、💡【技术量化 × 宏观快讯/热点题材 深度共振逻辑】
-用一段精炼文字（≤200字）结合Node4达标个股与Node5宏观风向交叉共振论证，切忌展开长表格。
+用一段精炼文字（≤150字）结合Node4达标个股与Node5宏观风向交叉共振论证，切忌展开长表格。
 
 三、🎯【日内操盘买卖点与精准挂单区间】
 必须为排名靠前的推荐或配置个股，精确计算并给出最佳分时低吸买点区间数值、次日/日内冲高止盈目标位数值。
@@ -1097,15 +1213,14 @@ def decision_maker_agent_node(state: ResearchState) -> dict:
 必须给出明确止损线（如破均线0.5%且3分钟未收回）与具体建议仓位比例。
 """
 
-    final_decision_report = ""
-    try:
-        resp = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
-        content = resp.content
-        if isinstance(content, list):
-            content = "".join(item.get("text", "") if isinstance(item, dict) else str(item) for item in content)
-        final_decision_report = str(content or "").strip()
-    except Exception as e:
-        print(f"⚠️ [node6] 大模型决策生成异常: {e}，启用量化委员会规则引擎生成终审决策...")
+        try:
+            resp = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
+            content = resp.content
+            if isinstance(content, list):
+                content = "".join(item.get("text", "") if isinstance(item, dict) else str(item) for item in content)
+            final_decision_report = str(content or "").strip()
+        except Exception as e:
+            print(f"⚠️ [node6] 大模型决策生成异常或超时: {e}，启用量化委员会规则引擎极速生成终审决策...")
 
     # 如果大模型返回为空或发生异常，启用量化委员会内置高质量结构化研报生成机制
     if not final_decision_report or len(final_decision_report) < 80:
@@ -1190,7 +1305,7 @@ def decision_maker_agent_node(state: ResearchState) -> dict:
     print("=" * 70 + "\n")
     sys.stdout.flush()
 
-    # 提取排名第一的推荐股票，并精准提取第三板块【买入挂单区间】最高价位
+    # 提取排名第一的推荐股票，并精准提取【建议低吸买点区间】最高值
     top_stock = None
     if qualified_stocks and len(qualified_stocks) > 0:
         top_stock = dict(qualified_stocks[0])

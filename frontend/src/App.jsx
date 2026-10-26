@@ -330,6 +330,7 @@ export default function App() {
     fetchRagDocCount()
     const interval = setInterval(() => {
       checkServer()
+      fetchRecommendations()
       fetchTasks()
       fetchRagDocCount()
     }, 5000)
@@ -944,15 +945,24 @@ export default function App() {
       )}
 
       {/* 数据库荐股入库记录展示卡片 (stock_recommendation) */}
-      {recommendations.length > 0 && (
-        <div className="recommendation-alert-banner">
-          <div className="recommendation-banner-left">
-            <span className="recommendation-banner-icon">🏆</span>
-            <div className="recommendation-banner-text">
-              <div className="recommendation-banner-title">
-                <h4>策略第一名已入库 <code>stock_recommendation</code> 表</h4>
-                <span className="rec-badge-tag">自动排重生效 (股票代码+买入日期唯一)</span>
-              </div>
+      <div className={`recommendation-alert-banner ${recommendations.length === 0 ? 'empty-state' : ''}`}>
+        <div className="recommendation-banner-left">
+          <span className="recommendation-banner-icon">{recommendations.length > 0 ? '🏆' : '📌'}</span>
+          <div className="recommendation-banner-text">
+            <div className="recommendation-banner-title">
+              {recommendations.length > 0 ? (
+                <>
+                  <h4>策略第一名已入库 <code>stock_recommendation</code> 表</h4>
+                  <span className="rec-badge-tag">自动排重生效 (股票代码+买入日期唯一)</span>
+                </>
+              ) : (
+                <>
+                  <h4 className="empty-title">数据库 <code>stock_recommendation</code> 荐股记录看板</h4>
+                  <span className="rec-badge-tag empty">等待策略研判入库</span>
+                </>
+              )}
+            </div>
+            {recommendations.length > 0 ? (
               <div className="recommendation-meta-row">
                 <span className="rec-chip code">股票代码: <strong>{recommendations[0].stock_code}</strong></span>
                 <span className="rec-chip name">股票名称: <strong>{recommendations[0].stock_name}</strong></span>
@@ -968,47 +978,56 @@ export default function App() {
                 )}
                 <span className="rec-chip time">创建时间: <strong>{recommendations[0].created_at}</strong></span>
               </div>
-            </div>
-          </div>
-          <div className="rec-banner-actions">
-            <button
-              type="button"
-              className="btn-monitor-break-direct"
-              onClick={() => handleDirectMonitorBreakPrices(false)}
-              title="立即执行开市日次日分时跌破均线卖出量化研判"
-            >
-              <span>⚡ 次日跌破均线监控</span>
-            </button>
-            <button
-              type="button"
-              className="btn-sync-close-direct"
-              onClick={handleDirectSyncClosePrices}
-              title="立即查询今日推荐标的并拉取行情回写收盘价"
-            >
-              <span>📊 同步收盘价</span>
-            </button>
-            <button
-              type="button"
-              className="btn-view-recs"
-              onClick={() => setShowRecModal(true)}
-              title="查看 stock_recommendation 历史记录"
-            >
-              <span>📋 查看荐股记录 ({recommendations.length} 条)</span>
-            </button>
-            <button
-              type="button"
-              className="btn-open-task-modal"
-              onClick={() => {
-                setActiveMenu('task_management')
-                fetchTasks()
-              }}
-              title="切换至定时任务管理中心"
-            >
-              <span>⏰ 定时任务管理 ({tasks.length})</span>
-            </button>
+            ) : (
+              <div className="recommendation-meta-row empty-tip">
+                <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
+                  当前数据库暂无今日荐股。点击“开始执行协同研判”后，系统将全市场精选龙头并在终审时自动将第一名写入 MySQL 表。
+                </span>
+              </div>
+            )}
           </div>
         </div>
-      )}
+        <div className="rec-banner-actions">
+          <button
+            type="button"
+            className="btn-monitor-break-direct"
+            onClick={() => handleDirectMonitorBreakPrices(false)}
+            title="立即执行开市日次日分时跌破均线卖出量化研判"
+          >
+            <span>⚡ 次日跌破均线监控</span>
+          </button>
+          <button
+            type="button"
+            className="btn-sync-close-direct"
+            onClick={handleDirectSyncClosePrices}
+            title="立即查询今日推荐标的并拉取行情回写收盘价"
+          >
+            <span>📊 同步收盘价</span>
+          </button>
+          <button
+            type="button"
+            className="btn-view-recs"
+            onClick={() => {
+              fetchRecommendations()
+              setShowRecModal(true)
+            }}
+            title="查看 stock_recommendation 历史记录"
+          >
+            <span>📋 查看荐股记录 ({recommendations.length} 条)</span>
+          </button>
+          <button
+            type="button"
+            className="btn-open-task-modal"
+            onClick={() => {
+              setActiveMenu('task_management')
+              fetchTasks()
+            }}
+            title="切换至定时任务管理中心"
+          >
+            <span>⏰ 定时任务管理 ({tasks.length})</span>
+          </button>
+        </div>
+      </div>
 
       {/* 运行时控制台窗口 (Core Window: 节点区分展示与准确换行) */}
       <section className={`terminal-window-wrapper ${isFullscreen ? 'fullscreen' : ''}`}>

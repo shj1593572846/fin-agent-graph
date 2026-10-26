@@ -1025,6 +1025,12 @@
   gap: 1rem;
 }
 
+.recommendation-alert-banner.empty-state {
+  background: linear-gradient(90deg, rgba(30, 41, 59, 0.65), rgba(15, 23, 42, 0.65));
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.15);
+}
+
 .recommendation-banner-left {
   display: flex;
   align-items: center;
@@ -1050,6 +1056,10 @@
   margin: 0;
 }
 
+.recommendation-banner-title h4.empty-title {
+  color: #cbd5e1;
+}
+
 .recommendation-banner-title code {
   background: rgba(0, 0, 0, 0.35);
   color: #38bdf8;
@@ -1065,6 +1075,12 @@
   border: 1px solid rgba(16, 185, 129, 0.4);
   padding: 0.1rem 0.45rem;
   border-radius: var(--radius-full);
+}
+
+.rec-badge-tag.empty {
+  background: rgba(148, 163, 184, 0.15);
+  color: #94a3b8;
+  border-color: rgba(148, 163, 184, 0.3);
 }
 
 .recommendation-meta-row {
@@ -2849,6 +2865,48 @@
   border-color: var(--border-focus);
 }
 
+.search-mode-filter-wrap {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.memory-filter-wrap {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.memory-badge-count {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.2rem 0.6rem;
+  border-radius: var(--radius-sm);
+  background: rgba(16, 185, 129, 0.15);
+  border: 1px solid rgba(16, 185, 129, 0.35);
+  color: #34d399;
+  font-size: 0.75rem;
+  font-weight: 600;
+  font-family: monospace;
+}
+
+.btn-clear-mem-inline {
+  background: rgba(239, 68, 68, 0.12);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+  color: #f87171;
+  font-size: 0.75rem;
+  padding: 0.2rem 0.5rem;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.btn-clear-mem-inline:hover {
+  background: rgba(239, 68, 68, 0.25);
+  border-color: #ef4444;
+  color: #ffffff;
+}
+
 .query-input-row {
   display: flex;
   flex-direction: column;
@@ -3251,6 +3309,34 @@
   padding: 0.1rem 0.4rem;
   border-radius: var(--radius-full);
   font-weight: 600;
+}
+
+.method-pill {
+  font-size: 0.68rem;
+  padding: 0.1rem 0.45rem;
+  border-radius: var(--radius-full);
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+}
+
+.method-pill.hybrid {
+  background: rgba(245, 158, 11, 0.18);
+  color: #fbbf24;
+  border: 1px solid rgba(245, 158, 11, 0.35);
+}
+
+.method-pill.vector {
+  background: rgba(59, 130, 246, 0.18);
+  color: #60a5fa;
+  border: 1px solid rgba(59, 130, 246, 0.35);
+}
+
+.method-pill.bm25 {
+  background: rgba(16, 185, 129, 0.18);
+  color: #34d399;
+  border: 1px solid rgba(16, 185, 129, 0.35);
 }
 
 .source-snippet {

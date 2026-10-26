@@ -1,0 +1,13 @@
+{
+  "s_demo": [
+    {
+      "turn_id": "turn_2f8f05",
+      "timestamp": "2026-10-22 16:20:54",
+      "query": "贵州茅台一季度表现",
+      "answer": "茅台营收增长显著，渠道良性运转。",
+      "stock_code": "600519",
+      "stock_name": "贵州茅台",
+      "category": null
+    }
+  ]
+}

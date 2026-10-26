@@ -84,10 +84,17 @@ async def health_check():
 async def get_recommendations(limit: int = 20):
     """查询 MySQL stock_recommendation 表中的最新股票推荐入库记录"""
     try:
-        from agent import db
+        try:
+            from agent import db
+        except Exception:
+            import importlib
+            db = importlib.import_module("agent.db")
         records = db.get_latest_recommendations(limit=limit)
         return {"success": True, "data": records, "count": len(records)}
     except Exception as e:
+        import traceback
+        err_msg = traceback.format_exc()
+        print(f"⚠️ [/api/recommendations] 查询异常: {e}\n{err_msg}")
         return {"success": False, "error": str(e), "data": [], "count": 0}
 
 
@@ -99,10 +106,53 @@ class RecommendationMonitorRequest(BaseModel):
 async def set_recommendation_monitor(rec_id: int, req: Optional[RecommendationMonitorRequest] = None):
     """更新某条股票推荐记录的【是否监控】状态"""
     try:
-        from agent import db
+        try:
+            from agent import db
+        except Exception:
+            import importlib
+            db = importlib.import_module("agent.db")
         target_status = req.is_monitored if req is not None else 1
         success, msg = db.update_recommendation_monitor_status(rec_id, target_status)
         return {"success": success, "message": msg, "is_monitored": target_status}
+    except Exception as e:
+        import traceback
+        err_msg = traceback.format_exc()
+        print(f"⚠️ [/api/recommendations/{rec_id}/monitor] 更新异常: {e}\n{err_msg}")
+        return {"success": False, "error": str(e)}
+
+
+# ==============================================================================
+# 用户记忆持久化管理 RESTful API (配置：用户操盘人设、交易风格、战法笔记等)
+# ==============================================================================
+class UserMemoryUpdateRequest(BaseModel):
+    user_role: Optional[str] = None
+    persona_title: Optional[str] = None
+    trading_style: Optional[str] = None
+    memory_notes: Optional[list[str]] = None
+    custom_preferences: Optional[dict] = None
+
+
+@app.get("/api/user-memory")
+async def get_user_memory():
+    """获取持久化的用户记忆数据"""
+    try:
+        from agent.user_memory import load_user_memory
+        mem = load_user_memory()
+        return {"success": True, "data": mem}
+    except Exception as e:
+        return {"success": False, "error": str(e), "data": {}}
+
+
+@app.post("/api/user-memory")
+async def update_user_memory(req: UserMemoryUpdateRequest):
+    """更新持久化用户记忆并写入 stock_data/user_memory.json"""
+    try:
+        from agent.user_memory import load_user_memory, save_user_memory
+        current = load_user_memory()
+        payload = {k: v for k, v in req.dict().items() if v is not None}
+        current.update(payload)
+        ok = save_user_memory(current)
+        return {"success": ok, "data": current, "message": "用户记忆更新成功并持久化生效！" if ok else "更新失败"}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
