@@ -20,6 +20,8 @@ class ResearchState(TypedDict, total=False):
     # === node1 产出 ===
     # 历史日K线数据或全市场股票下载汇总
     collected_data: str
+    kline_charts: Optional[List[str]]  # 生成的高清K线图路径列表 (含MA5/MA10/MA20/MA30)
+    kline_chart_path: Optional[str]    # 单个股票或首选标的的K线图表绝对路径
 
     # === node2 产出 ===
     # 筛选过滤后的高动能/涨停/多头股票数据及列表

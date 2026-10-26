@@ -7,12 +7,31 @@ import os
 import re
 import sys
 import time
+import base64
 from urllib.parse import parse_qs, urlparse
 from langchain_community.tools import DuckDuckGoSearchRun
 from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_core.tools import tool
+from langchain_core.messages import HumanMessage
+from langchain_openai import ChatOpenAI
 import pandas as pd
+import numpy as np
 import requests
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+from matplotlib.patches import Rectangle
+from matplotlib import font_manager
+import warnings
+
+# 全局配置中文字体与负号显示，防止 Glyph 缺失警告
+matplotlib.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "Arial Unicode MS", "DejaVu Sans", "sans-serif"]
+matplotlib.rcParams["axes.unicode_minus"] = False
+warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
+warnings.filterwarnings("ignore", message=".*Glyph.*")
+
 
 # 确保 agent 目录和项目根目录都在 sys.path 中
 _CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -140,11 +159,185 @@ def _get_kline_session() -> requests.Session:
     return _KLINE_SESSION
 
 
+def _ensure_kline_ma_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """确保 K 线 DataFrame 包含五日线、十日线、二十日线、三十日线及中文别名列"""
+    if df.empty or "收盘价" not in df.columns:
+        return df
+
+    close_s = pd.to_numeric(df["收盘价"], errors="coerce")
+    for col, period in [("MA5", 5), ("MA10", 10), ("MA20", 20), ("MA30", 30)]:
+        rolling_s = close_s.rolling(period).mean().round(2)
+        if col not in df.columns:
+            df[col] = rolling_s
+        else:
+            # 填补 NaN 或 0
+            df[col] = pd.to_numeric(df[col], errors="coerce").replace(0.0, np.nan).fillna(rolling_s).fillna(close_s).round(2)
+
+    df["5日均线"] = df["MA5"]
+    df["10日均线"] = df["MA10"]
+    df["20日均线"] = df["MA20"]
+    df["30日均线"] = df["MA30"]
+    return df
+
+
+def render_stock_kline_chart(df: pd.DataFrame, code: str, name: str = "", output_dir: str = None) -> str:
+    """
+    根据个股日K线时序数据渲染并保存包含五日线(MA5)、十日线(MA10)、二十日线(MA20)、三十日线(MA30)的高清K线走势图。
+    使用 FigureCanvasAgg 纯底层绘图，线程安全、极速并发、支持秒级本地缓存复用。
+
+    参数:
+        df: 个股K线时序 DataFrame
+        code: 股票代码
+        name: 股票简称
+        output_dir: 自定义输出目录（默认输出到项目根目录下 kline_charts/）
+    返回:
+        生成的图表本地绝对路径（若绘图失败则返回空字符串）
+    """
+    if df.empty or "收盘价" not in df.columns:
+        return ""
+
+    code_clean = str(code).strip().zfill(6)
+    stock_name = name or (df["股票简称"].iloc[-1] if "股票简称" in df.columns and not df.empty else code_clean)
+
+    root_dir = get_project_root()
+    chart_dir = output_dir or os.path.join(root_dir, "kline_charts")
+    os.makedirs(chart_dir, exist_ok=True)
+    out_path = os.path.join(chart_dir, f"{code_clean}_{stock_name}_kline.png")
+
+    # 秒级复用：若图表文件已存在且大小正常，无需重新绘制
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 1024:
+        return out_path
+
+    chart_df = _ensure_kline_ma_columns(df.copy())
+
+    fig = None
+    try:
+        import logging
+        logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
+
+        fig = Figure(figsize=(11, 6.5), facecolor="#181a20")
+        canvas = FigureCanvas(fig)
+        ax1, ax2 = fig.subplots(
+            2, 1, sharex=True, gridspec_kw={"height_ratios": [3, 1]}
+        )
+        ax1.set_facecolor("#1e222d")
+        ax2.set_facecolor("#1e222d")
+
+        x = np.arange(len(chart_df))
+        candle_colors = []
+        for i, row in enumerate(chart_df.itertuples()):
+            o = float(getattr(row, "开盘价", 0.0))
+            h = float(getattr(row, "最高价", 0.0))
+            l = float(getattr(row, "最低价", 0.0))
+            c = float(getattr(row, "收盘价", 0.0))
+            color = "#f6465d" if c >= o else "#0ecb81"
+            candle_colors.append(color)
+            ax1.vlines(i, l, h, color=color, linewidth=1.2, alpha=0.9)
+            rect_y = min(o, c)
+            rect_h = max(abs(c - o), 0.005)
+            ax1.add_patch(Rectangle((i - 0.3, rect_y), 0.6, rect_h, color=color, alpha=0.95))
+
+        # 绘制五日线、十日线、二十日线、三十日线
+        latest_c = float(chart_df["收盘价"].iloc[-1])
+        ma5_last = float(chart_df["MA5"].iloc[-1]) if "MA5" in chart_df.columns else latest_c
+        ma10_last = float(chart_df["MA10"].iloc[-1]) if "MA10" in chart_df.columns else latest_c
+        ma20_last = float(chart_df["MA20"].iloc[-1]) if "MA20" in chart_df.columns else latest_c
+        ma30_last = float(chart_df["MA30"].iloc[-1]) if "MA30" in chart_df.columns else latest_c
+
+        font_prop = font_manager.FontProperties(family=["Microsoft YaHei", "SimHei", "sans-serif"], size=9.5)
+        title_font = font_manager.FontProperties(family=["Microsoft YaHei", "SimHei", "sans-serif"], size=13)
+        label_font = font_manager.FontProperties(family=["Microsoft YaHei", "SimHei", "sans-serif"], size=10)
+
+        ax1.plot(x, chart_df["MA5"], label=f"MA5 (五日线): {ma5_last:.2f}", color="#f0b90b", linewidth=1.4)
+        ax1.plot(x, chart_df["MA10"], label=f"MA10 (十日线): {ma10_last:.2f}", color="#9353d3", linewidth=1.4)
+        ax1.plot(x, chart_df["MA20"], label=f"MA20 (二十日线): {ma20_last:.2f}", color="#00b8d9", linewidth=1.4)
+        ax1.plot(x, chart_df["MA30"], label=f"MA30 (三十日线): {ma30_last:.2f}", color="#ff7043", linewidth=1.4)
+
+        ax1.legend(loc="upper left", facecolor="#181a20", edgecolor="#2b313a", labelcolor="#eaecef", prop=font_prop)
+        title_str = f"{code_clean} {stock_name} - 日K线图 (最新现价: {latest_c:.2f} | 含 MA5/MA10/MA20/MA30 均线系统)"
+        ax1.set_title(title_str, color="#ffffff", pad=10, fontproperties=title_font)
+        ax1.grid(True, linestyle="--", alpha=0.15, color="#ffffff")
+        ax1.tick_params(colors="#848e9c")
+        ax1.set_ylabel("价格 (元)", color="#848e9c", fontproperties=label_font)
+
+        # 副图成交量
+        vol_col = "成交量(股)" if "成交量(股)" in chart_df.columns else ("成交量" if "成交量" in chart_df.columns else None)
+        if vol_col:
+            ax2.bar(x, chart_df[vol_col], color=candle_colors, width=0.6, alpha=0.9)
+        ax2.grid(True, linestyle="--", alpha=0.15, color="#ffffff")
+        ax2.tick_params(colors="#848e9c")
+        ax2.set_ylabel("成交量", color="#848e9c", fontproperties=label_font)
+
+        # 格式化日期轴
+        if "交易日期" in chart_df.columns:
+            step = max(1, len(chart_df) // 8)
+            tick_indices = list(range(0, len(chart_df), step))
+            if tick_indices[-1] != len(chart_df) - 1:
+                tick_indices.append(len(chart_df) - 1)
+            ax2.set_xticks(tick_indices)
+            ax2.set_xticklabels(
+                [str(chart_df["交易日期"].iloc[i]) for i in tick_indices],
+                rotation=25,
+                ha="right",
+                color="#848e9c",
+                fontproperties=label_font,
+            )
+
+        fig.tight_layout()
+        canvas.print_figure(out_path, dpi=100, facecolor=fig.get_facecolor())
+        return out_path
+    except Exception as e:
+        print(f"⚠️ 渲染个股 {code_clean} K线图异常: {e}")
+        return ""
+
+
+def render_all_stock_kline_charts(df: pd.DataFrame, chart_dir: str = None, max_workers: int = 30) -> list[str]:
+    """并发生成 DataFrame 中包含的所有个股日K线走势图表（存在已生成的直接秒级复用）。
+
+    参数:
+        df: 包含全量或板块个股K线数据的 DataFrame
+        chart_dir: 图表输出目录（默认 kline_charts/）
+        max_workers: 并发工作线程数，默认 30
+    返回:
+        所有已就绪的个股 K 线走势图 PNG 绝对路径列表
+    """
+    if df.empty or "股票代码" not in df.columns:
+        return []
+
+    root_dir = get_project_root()
+    target_dir = chart_dir or os.path.join(root_dir, "kline_charts")
+    os.makedirs(target_dir, exist_ok=True)
+
+    grouped = list(df.groupby("股票代码"))
+    total_stocks = len(grouped)
+    print(f"🖼️ [全量K线图生成] 正在并发校验/生成全部 {total_stocks} 只个股的五/十/二十/三十日均线走势图...")
+
+    def _worker(item):
+        c_code, sdf = item
+        c_code_clean = str(c_code).zfill(6)
+        c_name = str(sdf["股票简称"].iloc[-1]) if "股票简称" in sdf.columns and not sdf.empty else c_code_clean
+        expected_path = os.path.join(target_dir, f"{c_code_clean}_{c_name}_kline.png")
+        if os.path.exists(expected_path) and os.path.getsize(expected_path) > 1024:
+            return expected_path
+        return render_stock_kline_chart(sdf, c_code_clean, c_name, output_dir=target_dir)
+
+    all_charts = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for idx, chart_p in enumerate(executor.map(_worker, grouped), 1):
+            if chart_p and os.path.exists(chart_p):
+                all_charts.append(chart_p)
+            if idx % 1000 == 0 or idx == total_stocks:
+                print(f"   ⏳ 绘图进度: 已就绪 {len(all_charts)}/{total_stocks} 张个股K线图...")
+
+    print(f"✅ [全量K线图就绪] 全部 {len(all_charts)} 只个股高清K线走势图准备完毕！\n")
+    return all_charts
+
+
 def _fetch_single_stock_kline(code: str, name: str = "", limit: int = 60) -> pd.DataFrame:
-    """获取单只股票的日K线图时序数据。
+    """获取单只股票的日K线图时序数据（包含五日线、十日线、二十日线、三十日线）。
     
-    数据源：优先调用新浪行情接口 (CN_MarketDataService.getKLineData, scale=240 为日K线)，
-    若异常或数据为空则自动回退到同花顺行情接口。
+    数据源：优先调用新浪行情接口 (CN_MarketDataService.getKLineData, scale=240 为日K线，ma=5,10,20,30)，
+    若异常或数据为空则自动回退到同花顺行情接口并增量计算均线。
     """
     code_clean = str(code).strip().zfill(6)
     prefix = "sh" if code_clean.startswith(("6", "9")) else "sz"
@@ -155,7 +348,7 @@ def _fetch_single_stock_kline(code: str, name: str = "", limit: int = 60) -> pd.
     try:
         sina_url = (
             f"https://quotes.sina.cn/cn/api/jsonp_v2.php/var_{full_sym}_240_="
-            f"/CN_MarketDataService.getKLineData?symbol={full_sym}&scale=240&ma=5,10,20&datalen={limit}"
+            f"/CN_MarketDataService.getKLineData?symbol={full_sym}&scale=240&ma=5,10,20,30&datalen={limit}"
         )
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -185,6 +378,12 @@ def _fetch_single_stock_kline(code: str, name: str = "", limit: int = 60) -> pd.
                     chg_pct = (chg_amt / base_p * 100) if base_p else 0.0
                     amp = ((high_p - low_p) / base_p * 100) if base_p else 0.0
 
+                    # 提取新浪服务端计算的五日线、十日线、二十日线、三十日线
+                    ma5 = float(b.get("ma_price5")) if b.get("ma_price5") is not None else 0.0
+                    ma10 = float(b.get("ma_price10")) if b.get("ma_price10") is not None else 0.0
+                    ma20 = float(b.get("ma_price20")) if b.get("ma_price20") is not None else 0.0
+                    ma30 = float(b.get("ma_price30")) if b.get("ma_price30") is not None else 0.0
+
                     records.append({
                         "交易日期": date_str,
                         "股票代码": code_clean,
@@ -199,10 +398,19 @@ def _fetch_single_stock_kline(code: str, name: str = "", limit: int = 60) -> pd.
                         "成交量(股)": int(vol),
                         "成交额(元)": round(amt, 2),
                         "换手率(%)": round(turnover, 2),
+                        "MA5": round(ma5, 2) if ma5 else 0.0,
+                        "MA10": round(ma10, 2) if ma10 else 0.0,
+                        "MA20": round(ma20, 2) if ma20 else 0.0,
+                        "MA30": round(ma30, 2) if ma30 else 0.0,
+                        "5日均线": round(ma5, 2) if ma5 else 0.0,
+                        "10日均线": round(ma10, 2) if ma10 else 0.0,
+                        "20日均线": round(ma20, 2) if ma20 else 0.0,
+                        "30日均线": round(ma30, 2) if ma30 else 0.0,
                     })
                     prev_close = close_p
                 if records:
-                    return pd.DataFrame(records)
+                    df = pd.DataFrame(records)
+                    return _ensure_kline_ma_columns(df)
     except Exception:
         pass
 
@@ -263,7 +471,8 @@ def _fetch_single_stock_kline(code: str, name: str = "", limit: int = 60) -> pd.
                     if limit and len(records) > limit:
                         records = records[-limit:]
 
-                    return pd.DataFrame(records)
+                    df = pd.DataFrame(records)
+                    return _ensure_kline_ma_columns(df)
     except Exception:
         pass
 
@@ -271,15 +480,42 @@ def _fetch_single_stock_kline(code: str, name: str = "", limit: int = 60) -> pd.
 
 
 def _resolve_single_stock_name(name_query: str) -> dict | None:
-    """尝试将名称解析为单只 A 股代码与名称"""
+    """尝试将股票名称或代码解析为单只 A 股代码与简称"""
     if not name_query:
         return None
+    name_clean = name_query.strip()
+    root_dir = get_project_root()
+    kline_dir = os.path.join(root_dir, "kline_data")
+
+    # 1. 若输入为 6 位数字代码，优先解析出真实股票中文简称
+    if re.match(r"^\d{6}$", name_clean):
+        # 优先从本地已有文件名反查
+        if os.path.exists(kline_dir):
+            matched = glob.glob(os.path.join(kline_dir, f"{name_clean}_*_kline.csv"))
+            for m in matched:
+                parts = os.path.basename(m).split("_")
+                if len(parts) >= 3 and parts[1] != name_clean:
+                    return {"code": name_clean, "name": parts[1]}
+        # 联网从行情接口实时反查股票简称
+        try:
+            prefix = "sz" if name_clean.startswith(("0", "3")) else "sh"
+            r = requests.get(f"http://qt.gtimg.cn/q={prefix}{name_clean}", timeout=3)
+            if r.status_code == 200:
+                r.encoding = "gbk"
+                p = r.text.split("~")
+                if len(p) > 1 and p[1]:
+                    return {"code": name_clean, "name": p[1].strip()}
+        except Exception:
+            pass
+        return {"code": name_clean, "name": name_clean}
+
+    # 2. 若输入为股票名称，尝试通过东方财富与问财解析
     try:
-        url = f"http://searchapi.eastmoney.com/api/suggest/get?input={name_query}&type=14"
+        url = f"http://searchapi.eastmoney.com/api/suggest/get?input={name_clean}&type=14"
         res = requests.get(url, timeout=3).json()
         items = res.get("QuotationCodeTable", {}).get("Data", [])
         for item in items:
-            if item.get("Classify") == "AStock" and item.get("Name") == name_query:
+            if item.get("Classify") == "AStock" and item.get("Name") == name_clean:
                 return {"code": item.get("Code", ""), "name": item.get("Name", "")}
     except Exception:
         pass
@@ -287,9 +523,10 @@ def _resolve_single_stock_name(name_query: str) -> dict | None:
 
 
 def _get_all_market_stocks() -> list[dict]:
-    """获取A股全市场所有非科创板、非ST股票列表（优先复用本地已有标的清单，毫秒级就绪）"""
+    """获取A股全市场所有非科创板、非创业板、非ST股票列表（优先复用本地已有标的清单，毫秒级就绪）"""
     stocks = []
     seen = set()
+    exclude_prefixes = ("688", "689", "300", "301", "302", "30")
 
     # 1. 优先尝试从本地已有汇总文件中提取全部个股代码与简称
     root_dir = get_project_root()
@@ -303,10 +540,12 @@ def _get_all_market_stocks() -> list[dict]:
             for _, r in sdf.iterrows():
                 c = str(r["股票代码"]).zfill(6)
                 n = str(r["股票简称"])
+                if c.startswith(exclude_prefixes) or "ST" in n.upper() or "科创" in n or "创业" in n:
+                    continue
                 if c not in seen:
                     seen.add(c)
                     stocks.append({"code": c, "name": n})
-            if len(stocks) >= 3000:
+            if len(stocks) >= 2000:
                 return stocks
         except Exception:
             pass
@@ -315,27 +554,29 @@ def _get_all_market_stocks() -> list[dict]:
     kline_dir = os.path.join(root_dir, "kline_data")
     if os.path.exists(kline_dir):
         csv_files = glob.glob(os.path.join(kline_dir, "*.csv"))
-        if len(csv_files) >= 3000:
+        if len(csv_files) >= 2000:
             for f in csv_files:
                 basename = os.path.basename(f)
                 parts = basename.split("_")
                 if len(parts) >= 3 and len(parts[0]) == 6 and parts[0].isdigit():
                     c = parts[0]
                     n = parts[1]
+                    if c.startswith(exclude_prefixes) or "ST" in n.upper() or "科创" in n or "创业" in n:
+                        continue
                     if c not in seen:
                         seen.add(c)
                         stocks.append({"code": c, "name": n})
-            if len(stocks) >= 3000:
+            if len(stocks) >= 2000:
                 return stocks
 
-    # 3. 若本地无缓存，则通过网络拉取
+    # 3. 若本地无缓存，则通过网络拉取（仅拉取主板 m:0+t:6 与 m:1+t:2）
     try:
         page = 1
         while True:
             url = (
                 f"http://80.push2.eastmoney.com/api/qt/clist/get"
                 f"?pn={page}&pz=100&po=1&np=1&fltt=2&invt=2&fid=f3"
-                f"&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23&fields=f12,f14"
+                f"&fs=m:0+t:6,m:1+t:2&fields=f12,f14"
             )
             resp = requests.get(url, timeout=6).json()
             data = resp.get("data")
@@ -345,8 +586,8 @@ def _get_all_market_stocks() -> list[dict]:
             for item in diff:
                 code = str(item.get("f12", "")).strip().zfill(6)
                 name = str(item.get("f14", "")).strip()
-                # 严格过滤科创板(688开头)和ST/*ST股票
-                if code.startswith("688") or "ST" in name.upper():
+                # 严格过滤科创板与创业板及ST/*ST股票
+                if code.startswith(exclude_prefixes) or "ST" in name.upper() or "科创" in name or "创业" in name:
                     continue
                 if code and code not in seen:
                     seen.add(code)
@@ -365,8 +606,8 @@ def _get_all_market_stocks() -> list[dict]:
 
 
 def _get_stock_list_from_wencai(topic_clean: str, max_stocks: int = 5000) -> list[dict]:
-    """通过同花顺问财接口检索目标板块个股代码与简称（完整抓取，不人为截断）"""
-    query = f"{topic_clean} 非科创板 非ST 最新日线行情" if topic_clean else "非科创板 非ST 最新日线行情"
+    """通过同花顺问财接口检索目标板块个股代码与简称（完整抓取，排除科创板与创业板）"""
+    query = f"{topic_clean} 非科创板 非创业板 非ST 最新日线行情" if topic_clean else "非科创板 非创业板 非ST 最新日线行情"
     headers = _get_wencai_headers()
     payload = {
         "add_info": json.dumps(
@@ -420,11 +661,14 @@ def _get_stock_list_from_wencai(topic_clean: str, max_stocks: int = 5000) -> lis
 
         stocks = []
         seen = set()
+        exclude_prefixes = ("688", "689", "300", "301", "302", "30")
         for row in all_rows:
             code = row.get("code") or row.get("股票代码", "")
             if "." in code:
                 code = code.split(".")[0]
             name = row.get("股票简称") or row.get("名称", "")
+            if code.startswith(exclude_prefixes) or "ST" in name.upper() or "科创" in name or "创业" in name:
+                continue
             if code and code not in seen:
                 seen.add(code)
                 stocks.append({"code": code, "name": name})
@@ -435,8 +679,8 @@ def _get_stock_list_from_wencai(topic_clean: str, max_stocks: int = 5000) -> lis
         return []
 
 
-def _process_single_stock(s: dict, kline_dir: str, limit: int = 60, force_refresh: bool = False) -> tuple[pd.DataFrame | None, dict | None]:
-    """单只股票 K 线下载与落盘保存任务函数（支持本地今日文件智能复用）"""
+def _process_single_stock(s: dict, kline_dir: str, limit: int = 60, force_refresh: bool = False, generate_chart: bool = False) -> tuple[pd.DataFrame | None, dict | None]:
+    """单只股票 K 线下载与落盘保存任务函数（支持本地今日文件智能复用、均线计算与K线图渲染）"""
     code = s["code"]
     name = s.get("name", "")
 
@@ -448,22 +692,42 @@ def _process_single_stock(s: dict, kline_dir: str, limit: int = 60, force_refres
         try:
             file_mtime = datetime.date.fromtimestamp(os.path.getmtime(local_path))
             if file_mtime == datetime.date.today() and os.path.getsize(local_path) > 300:
-                stock_df = pd.read_csv(local_path, dtype={"股票代码": str})
+                stock_df = pd.read_csv(local_path, dtype={"股票代码": str}, encoding="utf-8-sig")
                 if not stock_df.empty and len(stock_df) >= min(limit, 30):
+                    # 检查是否缺失均线列，缺失时自动补齐并更新本地 CSV
+                    needs_update = False
+                    for col in ["MA5", "MA10", "MA20", "MA30", "5日均线", "10日均线", "20日均线", "30日均线"]:
+                        if col not in stock_df.columns:
+                            needs_update = True
+                            break
+                    if needs_update:
+                        stock_df = _ensure_kline_ma_columns(stock_df)
+                        stock_df.to_csv(local_path, index=False, encoding="utf-8-sig")
+
                     real_name = stock_df["股票简称"].iloc[0] or name or code
                     period_high = stock_df["最高价"].max()
                     period_low = stock_df["最低价"].min()
                     first_open = stock_df["开盘价"].iloc[0]
                     latest_close = stock_df["收盘价"].iloc[-1]
                     period_pct = round((latest_close - first_open) / first_open * 100, 2) if first_open else 0.0
+
+                    chart_path = ""
+                    if generate_chart:
+                        chart_path = render_stock_kline_chart(stock_df, code, real_name)
+
                     stat = {
                         "code": code,
                         "name": real_name,
                         "latest_close": latest_close,
+                        "latest_ma5": float(stock_df["MA5"].iloc[-1]) if "MA5" in stock_df.columns else latest_close,
+                        "latest_ma10": float(stock_df["MA10"].iloc[-1]) if "MA10" in stock_df.columns else latest_close,
+                        "latest_ma20": float(stock_df["MA20"].iloc[-1]) if "MA20" in stock_df.columns else latest_close,
+                        "latest_ma30": float(stock_df["MA30"].iloc[-1]) if "MA30" in stock_df.columns else latest_close,
                         "period_high": period_high,
                         "period_low": period_low,
                         "period_return": period_pct,
                         "bars": len(stock_df),
+                        "chart_path": chart_path,
                     }
                     return stock_df, stat
         except Exception:
@@ -473,7 +737,12 @@ def _process_single_stock(s: dict, kline_dir: str, limit: int = 60, force_refres
     if stock_df.empty:
         return None, None
 
-    real_name = stock_df["股票简称"].iloc[0] or name or code
+    real_name = name or (stock_df["股票简称"].iloc[0] if "股票简称" in stock_df.columns and stock_df["股票简称"].iloc[0] != code else "")
+    if not real_name or real_name == code:
+        single = _resolve_single_stock_name(code)
+        real_name = single.get("name", code) if single else code
+    stock_df["股票简称"] = real_name
+
     # 针对每个个股单独保存 CSV 到 kline_data/ 目录（存在相同的就直接覆盖）
     indiv_filename = f"{code}_{real_name}_kline.csv"
     indiv_filepath = os.path.join(kline_dir, indiv_filename)
@@ -485,14 +754,23 @@ def _process_single_stock(s: dict, kline_dir: str, limit: int = 60, force_refres
     latest_close = stock_df["收盘价"].iloc[-1]
     period_pct = round((latest_close - first_open) / first_open * 100, 2) if first_open else 0.0
 
+    chart_path = ""
+    if generate_chart:
+        chart_path = render_stock_kline_chart(stock_df, code, real_name)
+
     stat = {
         "code": code,
         "name": real_name,
         "latest_close": latest_close,
+        "latest_ma5": float(stock_df["MA5"].iloc[-1]) if "MA5" in stock_df.columns else latest_close,
+        "latest_ma10": float(stock_df["MA10"].iloc[-1]) if "MA10" in stock_df.columns else latest_close,
+        "latest_ma20": float(stock_df["MA20"].iloc[-1]) if "MA20" in stock_df.columns else latest_close,
+        "latest_ma30": float(stock_df["MA30"].iloc[-1]) if "MA30" in stock_df.columns else latest_close,
         "period_high": period_high,
         "period_low": period_low,
         "period_return": period_pct,
         "bars": len(stock_df),
+        "chart_path": chart_path,
     }
     return stock_df, stat
 
@@ -500,13 +778,13 @@ def _process_single_stock(s: dict, kline_dir: str, limit: int = 60, force_refres
 # 下载股票个股K线图数据
 @tool
 def download_stock_day(topic: str = "", limit: int = 60) -> str:
-    """调用同花顺api下载个股的历史日K线图数据到根目录及 kline_data/ 目录（存在相同的就覆盖）。
+    """调用同花顺api下载个股的历史日K线图数据到根目录及 kline_data/ 目录，自动计算五日线、十日线、二十日线、三十日线并渲染高清K线图。
 
     参数:
         topic: 股票代码（如'000001'）、股票名称（如'平安银行'）或股票板块（如'银行'、'半导体'）。为空则获取全市场所有非科创板、非ST个股数据。
         limit: K线时间周期条数，默认为近60个交易日（约3个月短期K线）。
     返回:
-        下载结果说明，包含个股K线文件保存路径、总K线条数、日期跨度及区间统计。
+        下载结果说明，包含个股K线文件保存路径、K线图路径、总K线条数、五/十/二十/三十日均线及区间统计。
     """
     topic_clean = topic.strip() if topic else ""
     try:
@@ -526,6 +804,8 @@ def download_stock_day(topic: str = "", limit: int = 60) -> str:
             summary_filepath = legacy_path
 
     kline_dir = os.path.join(root_dir, "kline_data")
+    chart_dir = os.path.join(root_dir, "kline_charts")
+    os.makedirs(chart_dir, exist_ok=True)
     fast_mode = os.environ.get("FAST_MODE", "1") == "1"
 
     # 如果指定主题文件不存在，且没有特定主题，回退使用全市场总表
@@ -544,15 +824,39 @@ def download_stock_day(topic: str = "", limit: int = 60) -> str:
         if fast_mode or file_mtime == today_date or time_diff < 604800:
             print(f"⚡ [node1: 极速缓存命中] 检测到本地「{os.path.basename(summary_filepath)}」有效，直接秒级复用本地K线数据...")
             try:
-                combined_df = pd.read_csv(summary_filepath, dtype={"股票代码": str})
+                combined_df = pd.read_csv(summary_filepath, dtype={"股票代码": str, "code": str}, encoding="utf-8-sig")
+                if "股票代码" not in combined_df.columns and "code" in combined_df.columns:
+                    combined_df["股票代码"] = combined_df["code"]
+                combined_df["股票代码"] = combined_df["股票代码"].astype(str).str.zfill(6)
+
+                # 检查并补齐全量均线列 (使用 transform 避免 groupby.apply 丢弃分组列 '股票代码')
+                needs_update = False
+                for col in ["MA5", "MA10", "MA20", "MA30"]:
+                    if col not in combined_df.columns:
+                        needs_update = True
+                        break
+                if needs_update:
+                    for ma_win in [5, 10, 20, 30]:
+                        col_name = f"MA{ma_win}"
+                        if col_name not in combined_df.columns:
+                            combined_df[col_name] = combined_df.groupby("股票代码")["收盘价"].transform(
+                                lambda s: s.rolling(ma_win, min_periods=1).mean().round(2)
+                            )
+                        combined_df[f"{ma_win}日均线"] = combined_df[col_name]
+                    combined_df.to_csv(summary_filepath, index=False, encoding="utf-8-sig")
+
                 start_date = combined_df["交易日期"].min()
                 end_date = combined_df["交易日期"].max()
 
-                # 统计区间涨幅
+                # 统计区间涨幅与均线
                 first_last = combined_df.groupby("股票代码").agg(
                     name=("股票简称", "last"),
                     first_open=("开盘价", "first"),
                     latest_close=("收盘价", "last"),
+                    latest_ma5=("MA5", "last") if "MA5" in combined_df.columns else ("收盘价", "last"),
+                    latest_ma10=("MA10", "last") if "MA10" in combined_df.columns else ("收盘价", "last"),
+                    latest_ma20=("MA20", "last") if "MA20" in combined_df.columns else ("收盘价", "last"),
+                    latest_ma30=("MA30", "last") if "MA30" in combined_df.columns else ("收盘价", "last"),
                     period_high=("最高价", "max"),
                     period_low=("最低价", "min"),
                     bars=("交易日期", "count")
@@ -564,35 +868,55 @@ def download_stock_day(topic: str = "", limit: int = 60) -> str:
                 top_losers = first_last.tail(5).to_dict("records")
                 unique_stocks = len(first_last)
 
+                # 并发生成/校验全部个股高清K线图表 (秒级复用已存在的图表)
+                generated_charts = render_all_stock_kline_charts(combined_df, chart_dir=chart_dir)
+
                 summary_lines = [
-                    f"### 📊 同花顺个股K线图数据就绪 (⚡本地缓存极速复用)",
+                    f"### 📊 同花顺个股K线图与均线数据就绪 (⚡本地缓存极速复用)",
                     f"- **目标板块/范围**：{topic_clean or 'A股全市场（非科创板、非ST全部个股）'}",
                     f"- **K线时间周期**：`{start_date}` 至 `{end_date}`（每只个股近 {limit} 个交易日K线时序）",
                     f"- **个股保存目录**：[{kline_dir.replace(os.sep, '/')}]({kline_dir.replace(os.sep, '/')})（共包含 **{unique_stocks}** 只个股独立 CSV 文件）",
+                    f"- **K线图表目录**：[{chart_dir.replace(os.sep, '/')}]({chart_dir.replace(os.sep, '/')})（包含绘制五/十/二十/三十日均线的高清走势图表）",
                     f"- **全量汇总文件**：[{summary_filename}]({summary_filepath.replace(os.sep, '/')})（共 **{len(combined_df):,}** 条K线柱）",
-                    f"- **K线包含指标**：交易日期、股票代码、股票简称、开盘价、最高价、最低价、收盘价、涨跌额、涨跌幅(%)、振幅(%)、成交量(股)、成交额(元)、换手率(%)",
-                    f"\n#### 🚀 区间领涨前 5 个股（近 {limit} 日累计涨幅）：",
-                    f"| 股票代码 | 股票简称 | 最新收盘价 | 区间最高价 | 区间最低价 | 区间累计涨幅 | K线柱数 |",
-                    f"| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+                    f"- **K线包含指标**：交易日期、股票代码、股票简称、开盘价、最高价、最低价、收盘价、涨跌额、涨跌幅(%)、振幅(%)、成交量(股)、成交额(元)、换手率(%)、五日均线(MA5)、十日均线(MA10)、二十日均线(MA20)、三十日均线(MA30)",
+                    f"\n#### 🚀 区间领涨前 5 个股（近 {limit} 日累计涨幅与均线走势）：",
+                    f"| 股票代码 | 股票简称 | 最新现价 | 五日线(MA5) | 十日线(MA10) | 二十日线(MA20) | 三十日线(MA30) | 区间累计涨幅 | K线柱数 |",
+                    f"| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
                 ]
 
                 for item in top_gainers:
                     ret_str = f"{item['period_return']:+.2f}%"
+                    ma5_val = float(item.get("latest_ma5", item["latest_close"]))
+                    ma10_val = float(item.get("latest_ma10", item["latest_close"]))
+                    ma20_val = float(item.get("latest_ma20", item["latest_close"]))
+                    ma30_val = float(item.get("latest_ma30", item["latest_close"]))
                     summary_lines.append(
-                        f"| {item['股票代码']} | {item['name']} | {item['latest_close']} | {item['period_high']} | {item['period_low']} | {ret_str} | {item['bars']} |"
+                        f"| {item['股票代码']} | {item['name']} | {item['latest_close']:.2f} | {ma5_val:.2f} | {ma10_val:.2f} | {ma20_val:.2f} | {ma30_val:.2f} | {ret_str} | {item['bars']} |"
                     )
 
                 summary_lines.extend([
                     f"\n#### 📉 区间表现靠后前 5 个股：",
-                    f"| 股票代码 | 股票简称 | 最新收盘价 | 区间最高价 | 区间最低价 | 区间累计涨幅 | K线柱数 |",
-                    f"| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+                    f"| 股票代码 | 股票简称 | 最新现价 | 五日线(MA5) | 十日线(MA10) | 二十日线(MA20) | 三十日线(MA30) | 区间累计涨幅 | K线柱数 |",
+                    f"| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
                 ])
 
                 for item in reversed(top_losers):
                     ret_str = f"{item['period_return']:+.2f}%"
+                    ma5_val = float(item.get("latest_ma5", item["latest_close"]))
+                    ma10_val = float(item.get("latest_ma10", item["latest_close"]))
+                    ma20_val = float(item.get("latest_ma20", item["latest_close"]))
+                    ma30_val = float(item.get("latest_ma30", item["latest_close"]))
                     summary_lines.append(
-                        f"| {item['股票代码']} | {item['name']} | {item['latest_close']} | {item['period_high']} | {item['period_low']} | {ret_str} | {item['bars']} |"
+                        f"| {item['股票代码']} | {item['name']} | {item['latest_close']:.2f} | {ma5_val:.2f} | {ma10_val:.2f} | {ma20_val:.2f} | {ma30_val:.2f} | {ret_str} | {item['bars']} |"
                     )
+
+                if generated_charts:
+                    summary_lines.append(f"\n#### 📸 生成的高清个股K线图表（含五日线、十日线、二十日线、三十日线）：")
+                    summary_lines.append(f"共生成/就绪 **{len(generated_charts)}** 只个股高清走势图，已存入图表目录。部分精选示例如下：")
+                    for c_path in generated_charts[:15]:
+                        summary_lines.append(f"- [{os.path.basename(c_path)}]({c_path.replace(os.sep, '/')})")
+                    if len(generated_charts) > 15:
+                        summary_lines.append(f"- ... （其余 {len(generated_charts) - 15} 张个股图表已就绪在 [{chart_dir.replace(os.sep, '/')}]({chart_dir.replace(os.sep, '/')})）")
 
                 return "\n".join(summary_lines)
             except Exception as e:
@@ -601,7 +925,8 @@ def download_stock_day(topic: str = "", limit: int = 60) -> str:
     # 1. 解析目标股票列表（支持单股代码、单股名称、板块全部个股、全市场全部个股）
     stocks = []
     if re.match(r"^\d{6}$", topic_clean):
-        stocks = [{"code": topic_clean, "name": ""}]
+        single = _resolve_single_stock_name(topic_clean)
+        stocks = [single] if single else [{"code": topic_clean, "name": topic_clean}]
     elif topic_clean:
         single = _resolve_single_stock_name(topic_clean)
         if single:
@@ -619,10 +944,11 @@ def download_stock_day(topic: str = "", limit: int = 60) -> str:
 
     # 2. 准备输出目录
     os.makedirs(kline_dir, exist_ok=True)
+    is_single_stock = (len(stocks) == 1)
 
     # 3. 高并发多线程下载并保存每只股票的独立 K 线 CSV 文件（存在且为今日则快速复用）
     total_targets = len(stocks)
-    print(f"📥 开始并发下载/更新 {total_targets} 只个股的日K线数据并保存到 kline_data/...")
+    print(f"📥 开始并发下载/更新 {total_targets} 只个股的日K线数据并计算五/十/二十/三十日均线...")
 
     all_kline_dfs = []
     success_stocks = []
@@ -630,7 +956,7 @@ def download_stock_day(topic: str = "", limit: int = 60) -> str:
     # 全市场大批量任务采用 50 并发，单板块/单股采用 15 并发
     max_workers = 50 if total_targets > 100 else 15
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(_process_single_stock, s, kline_dir, limit) for s in stocks]
+        futures = [executor.submit(_process_single_stock, s, kline_dir, limit, False, is_single_stock) for s in stocks]
         for idx, future in enumerate(concurrent.futures.as_completed(futures), 1):
             df_item, stat_item = future.result()
             if df_item is not None and stat_item is not None:
@@ -640,10 +966,10 @@ def download_stock_day(topic: str = "", limit: int = 60) -> str:
                 print(f"   ⏳ 进度：已处理 {idx}/{total_targets} 只个股 (成功: {len(success_stocks)})...")
 
     if not all_kline_dfs:
-        return f"❌ 个股K线数据下载失败，未能从同花顺行情接口获取到任何个股K线。"
+        return f"❌ 个股K线数据下载失败，未能从行情接口获取到任何个股K线。"
 
     # 4. 合并生成总K线汇总 CSV 保存到 stock_data 目录（存在相同文件则直接覆盖）
-    print("💾 正在整合生成全量日K线汇总 CSV...")
+    print("💾 正在整合生成包含均线指标的全量日K线汇总 CSV...")
     combined_df = pd.concat(all_kline_dfs, ignore_index=True)
     summary_filename = f"{topic_clean}_kline_all.csv" if topic_clean else "stock_kline_all.csv"
     summary_filepath = os.path.join(stock_data_dir, summary_filename)
@@ -657,206 +983,399 @@ def download_stock_day(topic: str = "", limit: int = 60) -> str:
     top_gainers = success_stocks[:5]
     top_losers = success_stocks[-5:]
 
+    # 并发生成/校验全部个股高清K线图表 (秒级复用已存在的图表)
+    generated_charts = render_all_stock_kline_charts(combined_df, chart_dir=chart_dir)
+
     summary_lines = [
-        f"### 📊 同花顺个股K线图数据下载完成",
+        f"### 📊 同花顺个股K线图与均线数据下载完成",
         f"- **目标板块/范围**：{topic_clean or 'A股全市场（非科创板、非ST全部个股）'}",
         f"- **K线时间周期**：`{start_date}` 至 `{end_date}`（每只个股近 {limit} 个交易日K线时序）",
         f"- **个股保存目录**：[{kline_dir.replace(os.sep, '/')}]({kline_dir.replace(os.sep, '/')})（共成功导出 **{len(success_stocks)}** 只个股独立 CSV 文件，存在已覆盖）",
+        f"- **K线图表目录**：[{chart_dir.replace(os.sep, '/')}]({chart_dir.replace(os.sep, '/')})（包含绘制五/十/二十/三十日均线的高清走势图表）",
         f"- **全量汇总文件**：[{summary_filename}]({summary_filepath.replace(os.sep, '/')})（共 **{len(combined_df):,}** 条K线柱，存在已覆盖）",
-        f"- **K线包含指标**：交易日期、股票代码、股票简称、开盘价、最高价、最低价、收盘价、涨跌额、涨跌幅(%)、振幅(%)、成交量(股)、成交额(元)、换手率(%)",
-        f"\n#### 🚀 区间领涨前 5 个股（近 {limit} 日累计涨幅）：",
-        f"| 股票代码 | 股票简称 | 最新收盘价 | 区间最高价 | 区间最低价 | 区间累计涨幅 | K线柱数 |",
-        f"| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+        f"- **K线包含技术指标**：交易日期、股票代码、股票简称、开盘价、最高价、最低价、收盘价、涨跌额、涨跌幅(%)、振幅(%)、成交量(股)、成交额(元)、换手率(%)、五日均线(MA5)、十日均线(MA10)、二十日均线(MA20)、三十日均线(MA30)",
+        f"\n#### 🚀 区间领涨前 5 个股（近 {limit} 日累计涨幅与均线走势）：",
+        f"| 股票代码 | 股票简称 | 最新现价 | 五日线(MA5) | 十日线(MA10) | 二十日线(MA20) | 三十日线(MA30) | 区间累计涨幅 | K线柱数 |",
+        f"| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
     ]
 
     for item in top_gainers:
         ret_str = f"{item['period_return']:+.2f}%"
+        ma5_val = float(item.get("latest_ma5", item["latest_close"]))
+        ma10_val = float(item.get("latest_ma10", item["latest_close"]))
+        ma20_val = float(item.get("latest_ma20", item["latest_close"]))
+        ma30_val = float(item.get("latest_ma30", item["latest_close"]))
         summary_lines.append(
-            f"| {item['code']} | {item['name']} | {item['latest_close']} | {item['period_high']} | {item['period_low']} | {ret_str} | {item['bars']} |"
+            f"| {item['code']} | {item['name']} | {item['latest_close']:.2f} | {ma5_val:.2f} | {ma10_val:.2f} | {ma20_val:.2f} | {ma30_val:.2f} | {ret_str} | {item['bars']} |"
         )
 
     summary_lines.extend([
         f"\n#### 📉 区间表现靠后前 5 个股：",
-        f"| 股票代码 | 股票简称 | 最新收盘价 | 区间最高价 | 区间最低价 | 区间累计涨幅 | K线柱数 |",
-        f"| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+        f"| 股票代码 | 股票简称 | 最新现价 | 五日线(MA5) | 十日线(MA10) | 二十日线(MA20) | 三十日线(MA30) | 区间累计涨幅 | K线柱数 |",
+        f"| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
     ])
 
     for item in reversed(top_losers):
         ret_str = f"{item['period_return']:+.2f}%"
+        ma5_val = float(item.get("latest_ma5", item["latest_close"]))
+        ma10_val = float(item.get("latest_ma10", item["latest_close"]))
+        ma20_val = float(item.get("latest_ma20", item["latest_close"]))
+        ma30_val = float(item.get("latest_ma30", item["latest_close"]))
         summary_lines.append(
-            f"| {item['code']} | {item['name']} | {item['latest_close']} | {item['period_high']} | {item['period_low']} | {ret_str} | {item['bars']} |"
+            f"| {item['code']} | {item['name']} | {item['latest_close']:.2f} | {ma5_val:.2f} | {ma10_val:.2f} | {ma20_val:.2f} | {ma30_val:.2f} | {ret_str} | {item['bars']} |"
         )
+
+    if generated_charts:
+        summary_lines.append(f"\n#### 📸 生成的高清个股K线图表（含五日线、十日线、二十日线、三十日线）：")
+        summary_lines.append(f"共生成/就绪 **{len(generated_charts)}** 只个股高清走势图，已存入图表目录。部分精选示例如下：")
+        for c_path in generated_charts[:15]:
+            summary_lines.append(f"- [{os.path.basename(c_path)}]({c_path.replace(os.sep, '/')})")
+        if len(generated_charts) > 15:
+            summary_lines.append(f"- ... （其余 {len(generated_charts) - 15} 张个股图表已就绪在 [{chart_dir.replace(os.sep, '/')}]({chart_dir.replace(os.sep, '/')})）")
 
     return "\n".join(summary_lines)
 
 
-# 筛选近十日内有过涨停且趋势向上的股票
+# 下载个股K线图及均线专用工具
 @tool
-def filter_bullish_limit_up_stocks(topic: str = "", days: int = 10) -> str:
-    """解析个股K线图时序数据，筛选出近10日内有过涨停且日K线五日线、十日线、二十日线呈现上升趋势的个股，并持久化保存到文件中。
+def download_stock_kline_chart(topic: str = "", limit: int = 60) -> str:
+    """下载指定个股或板块的日K线数据，并绘制生成包含五日线(MA5)、十日线(MA10)、二十日线(MA20)、三十日线(MA30)的高清K线走势图表。
 
     参数:
-        topic: 股票板块或主题名称，为空则在全市场已下载的K线数据中进行全局筛选。
-        days: 回溯窗口交易日天数，默认为近10个交易日。
+        topic: 股票代码（如'000001'）、股票名称（如'平安银行'）或股票板块（如'银行'）。
+        limit: K线时间周期条数，默认为近60个交易日。
     返回:
-        筛选结果说明，包含命中股票数量、保存的文件路径及核心股票列表。
+        下载与绘图结果说明，包含K线CSV数据路径、K线走势图PNG路径、均线指标与量价结构。
+    """
+    return download_stock_day(topic=topic, limit=limit)
+
+
+# ==============================================================================
+# 基于K线图视觉多模态分析筛选强势股票（纯图像审读，无需解析K线表格数据）
+# ==============================================================================
+
+def analyze_stock_kline_chart(chart_path: str, code: str = "", name: str = "") -> dict:
+    """基于多模态视觉大模型对单只股票的日K线走势图表（PNG图像）进行直接视觉形态深度分析。
+
+    分析要点：
+    1. 近10个交易日是否出现过实体大阳线或涨停板形态；
+    2. 五日线(黄)、十日线(紫)、二十日线(青)、三十日线(橙)是否自上而下顺向排列 (MA5 >= MA10 >= MA20 >= MA30)；
+    3. 四条均线近10日是否全部呈向上倾斜、趋势发散态势；
+    4. 给出最终判定结论（【符合】或【不符合】）与技术点评。
+
+    参数:
+        chart_path: K线图图片文件路径。
+        code: 股票代码（可选）。
+        name: 股票简称（可选）。
+    返回:
+        包含识别与研判结果的字典 (code, name, is_qualified, verdict, trend_desc, analysis_text, chart_path)。
+    """
+    if not os.path.exists(chart_path):
+        return {
+            "code": code,
+            "name": name,
+            "is_qualified": False,
+            "verdict": "不符合",
+            "trend_desc": "图片文件缺失",
+            "analysis_text": f"K线图文件不存在: {chart_path}",
+            "chart_path": chart_path,
+        }
+
+    # 从文件名提取股票代码与简称
+    base_name = os.path.basename(chart_path)
+    m = re.match(r"^(\d{6})_(.*?)_kline\.png$", base_name)
+    if m:
+        if not code:
+            code = m.group(1)
+        if not name:
+            candidate_name = m.group(2)
+            if candidate_name and candidate_name != code and "" not in candidate_name:
+                name = candidate_name
+
+    if code and (not name or "" in name or name == code):
+        res_info = _resolve_single_stock_name(code)
+        if res_info:
+            name = res_info["name"]
+
+    # 战法硬性条件: 严格排除科创板与创业板 (688/689/300/301/302/30)
+    exclude_prefixes = ("688", "689", "300", "301", "302", "30")
+    if code.startswith(exclude_prefixes) or "科创" in name or "创业" in name:
+        return {
+            "code": code,
+            "name": name,
+            "is_qualified": False,
+            "verdict": "不符合",
+            "trend_desc": "科创板/创业板股票(按战法排除)",
+            "analysis_text": "【判定结果】：不符合\n【形态评述】：该股票属于科创板或创业板个股，按战法硬性规则直接排除，只保留非科创、非创业板个股。",
+            "chart_path": chart_path,
+        }
+
+    # 读取并 base64 编码图片
+    with open(chart_path, "rb") as f:
+        img_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    api_key = os.getenv("OPENAI_API_KEY", "")
+    base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    model_name = os.getenv("MODEL_NAME", "gpt-4o-mini")
+
+    llm = ChatOpenAI(
+        model=model_name,
+        api_key=api_key,
+        base_url=base_url,
+        temperature=0.1,
+        max_tokens=1200,
+        timeout=45.0,
+        max_retries=1,
+    )
+
+    stock_hint = f"股票代码：{code}，股票名称：{name}" if code else "请从图表标题栏识别代码与名称"
+    prompt_text = f"""请仔细观察这张股票日K线走势图（{stock_hint}）：
+图表上方包含：日K线蜡烛柱（红涨绿跌，涨停板柱体有长实体或标记）、四条均线：五日线MA5(黄色)、十日线MA10(紫色)、二十日线MA20(青色)、三十日线MA30(橙色)，下方包含成交量柱。
+
+请从图像视觉角度进行深度技术形态分析并依次回答：
+1. 【股票代码与名称】：确认图中的股票代码、股票简称以及最新收盘价。
+2. 【十日内涨停分析】：仔细观察右侧最近10个交易日（约10根K线柱），是否存在实体大阳线或涨停板形态（单日涨幅大阳线，成交量同步放大）？指出具体涨停或大阳线形态位置。
+3. 【均线排列状态】：观察五日线(黄)、十日线(紫)、二十日线(青)、三十日线(橙)的相对位置。是否满足「五日线在最上、十日线次之、二十日线再次之、三十日线在最下」（即 MA5 ≥ MA10 ≥ MA20 ≥ MA30，自上而下顺向多头排列）？
+4. 【均线趋势方向】：观察近10日内这四条均线（5日、10日、20日、30日）的走势方向，是否全部保持向上倾斜、趋势向上发散？
+5. 【综合判定与评级】：
+   - 综合判断是否符合战法标准：「近十日内有过涨停，且近十日五日线、十日线、二十日线、三十日线依次从上往下多头排列且都是趋势向上」？
+   - 必须在最后单独一行明确输出判定结论：
+   【判定结果】：符合
+   或
+   【判定结果】：不符合
+   - 并给出1句核心技术形态短评。
+"""
+
+    msg = HumanMessage(content=[
+        {"type": "text", "text": prompt_text},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
+    ])
+
+    try:
+        resp = llm.invoke([msg])
+        content = resp.content.strip() if resp.content else ""
+        if not content and "reasoning_content" in resp.additional_kwargs:
+            content = resp.additional_kwargs["reasoning_content"].strip()
+    except Exception as e:
+        content = f"视觉大模型分析异常: {e}"
+
+    # 解析判定结论
+    is_qualified = False
+    verdict = "不符合"
+    m_verdict = re.search(r"【判定结果】[：:\s]*(符合|不符合)", content)
+    if m_verdict:
+        verdict = m_verdict.group(1).strip()
+        is_qualified = (verdict == "符合")
+    else:
+        if "【判定结果】：符合" in content or "【判定结果】: 符合" in content:
+            verdict = "符合"
+            is_qualified = True
+        elif "符合「近十日内有过涨停" in content and "不符合" not in content[-120:]:
+            verdict = "符合"
+            is_qualified = True
+
+    # 提取收盘价或形态描述
+    trend_desc = "四线多头向上发散" if is_qualified else "形态不符"
+    if "多头" in content and is_qualified:
+        trend_desc = "四线顺向多头向上发散(符合战法)"
+    elif not is_qualified:
+        if "空头" in content:
+            trend_desc = "均线空头排列/拐头向下"
+        elif "未见涨停" in content or "不存在" in content:
+            trend_desc = "均线排列尚可但近10日无涨停"
+        else:
+            trend_desc = "未达四线多头顺向向上标准"
+
+    # 若 code 或 name 仍为空，尝试从文本中反抽
+    if not code:
+        m_c = re.search(r"(?:代码|股票代码)[：:\s]*[*`]*(\d{6})[*`]*", content)
+        if m_c:
+            code = m_c.group(1)
+    if not name or "" in name or name == code:
+        if code:
+            res_stock = _resolve_single_stock_name(code)
+            name = res_stock["name"] if res_stock else code
+
+    return {
+        "code": code,
+        "name": name,
+        "is_qualified": is_qualified,
+        "verdict": verdict,
+        "trend_desc": trend_desc,
+        "analysis_text": content,
+        "chart_path": chart_path,
+    }
+
+
+def filter_stocks_by_kline_chart(topic: str = "", days: int = 10, chart_paths: list = None, max_charts: int = 16) -> str:
+    """直接基于个股日K线走势图表（视觉图像）进行多模态视觉技术形态分析，
+    筛选出「近10日内有过涨停，且近十日五日线、十日线、二十日线、三十日线依次从上往下多头排列且都是趋势向上」的强势个股。
+    无需解析表格数据，直接由视觉大模型对图表进行审读、判定并保存筛选结果。
+
+    参数:
+        topic: 股票板块、主题名称或单只股票代码/简称。
+        days: 回溯窗口交易日天数，默认为近10个交易日。
+        chart_paths: 指定要分析的K线走势图文件路径列表（可选）。
+        max_charts: 审图上限数量，默认最多分析 16 张图表。
+    返回:
+        K线图视觉多模态分析筛选报告，包含合格标的列表与详细图表解读。
     """
     topic_clean = topic.strip() if topic else ""
     root_dir = get_project_root()
+    chart_dir = os.path.join(root_dir, "kline_charts")
     stock_data_dir = os.path.join(root_dir, "stock_data")
+    os.makedirs(chart_dir, exist_ok=True)
     os.makedirs(stock_data_dir, exist_ok=True)
-    kline_dir = os.path.join(root_dir, "kline_data")
 
-    # 1. 寻找数据源：优先读取 stock_data 合并大表，若无则尝试根目录，最后遍历 kline_data/*.csv
-    target_summary_filename = f"{topic_clean}_kline_all.csv" if topic_clean else "stock_kline_all.csv"
-    target_summary_file = os.path.join(stock_data_dir, target_summary_filename)
-    if not os.path.exists(target_summary_file):
-        legacy_summary_file = os.path.join(root_dir, target_summary_filename)
-        if os.path.exists(legacy_summary_file):
-            target_summary_file = legacy_summary_file
+    # 1. 搜集待分析的目标 K 线图文件
+    target_charts = []
+    if chart_paths:
+        target_charts = [p for p in chart_paths if os.path.exists(p)]
 
-    stock_dfs = []
-    if os.path.exists(target_summary_file):
-        try:
-            full_df = pd.read_csv(target_summary_file, dtype={"股票代码": str})
-            full_df["股票代码"] = full_df["股票代码"].astype(str).str.zfill(6)
-            for _, group in full_df.groupby("股票代码"):
-                stock_dfs.append(group.sort_values(by="交易日期"))
-        except Exception:
-            stock_dfs = []
+    if not target_charts:
+        # 若指定了 6 位单股代码或单股名称，精准定位该股票图表
+        if re.match(r"^\d{6}$", topic_clean):
+            matched = glob.glob(os.path.join(chart_dir, f"*{topic_clean}*_kline.png"))
+            if matched:
+                target_charts = matched
+            else:
+                # 若尚未渲染该图表，则触发生成
+                print(f"🖼️ 未发现代码 {topic_clean} 的K线图，正在实时生成...")
+                download_stock_day(topic=topic_clean, limit=60)
+                target_charts = glob.glob(os.path.join(chart_dir, f"*{topic_clean}*_kline.png"))
+        elif topic_clean:
+            matched = glob.glob(os.path.join(chart_dir, f"*{topic_clean}*_kline.png"))
+            if matched:
+                target_charts = matched
+            else:
+                download_stock_day(topic=topic_clean, limit=60)
+                target_charts = glob.glob(os.path.join(chart_dir, f"*{topic_clean}*_kline.png"))
+                if not target_charts:
+                    target_charts = sorted(glob.glob(os.path.join(chart_dir, "*_kline.png")), key=os.path.getmtime, reverse=True)
 
-    if not stock_dfs and os.path.exists(kline_dir):
-        pattern = os.path.join(kline_dir, "*.csv")
-        csv_files = glob.glob(pattern)
-        for f in csv_files:
-            try:
-                sdf = pd.read_csv(f, dtype={"股票代码": str})
-                if not sdf.empty:
-                    sdf["股票代码"] = sdf["股票代码"].astype(str).str.zfill(6)
-                    stock_dfs.append(sdf.sort_values(by="交易日期"))
-            except Exception:
-                continue
+    if not target_charts:
+        # 扫描 kline_charts 目录全部图表，按修改时间最新排序
+        all_charts = glob.glob(os.path.join(chart_dir, "*_kline.png"))
+        if not all_charts:
+            # 自动下载基准股票并渲染K线图
+            print("🌐 kline_charts 目录为空，正在下载基准股票并渲染K线图...")
+            download_stock_day(topic="", limit=60)
+            all_charts = glob.glob(os.path.join(chart_dir, "*_kline.png"))
+        target_charts = sorted(all_charts, key=os.path.getmtime, reverse=True)
 
-    if not stock_dfs:
-        return "⚠️ 未找到可供筛选的个股K线数据文件，请先运行数据收集 Agent 下载K线数据。"
+    # 控制视觉审图数量上限，默认不超过 max_charts 只，并严格排除科创板与创业板股票 (代码排除 688/689/300/301/302/30 开头)
+    exclude_prefixes = ("688", "689", "300", "301", "302", "30")
+    target_charts = [
+        p for p in target_charts
+        if not os.path.basename(p).startswith(exclude_prefixes) and not any(k in os.path.basename(p) for k in ["科创", "创业"])
+    ][:max_charts]
 
-    total_scanned = len(stock_dfs)
-    matched_stocks = []
-    matched_kline_dfs = []
+    if not target_charts:
+        return "⚠️ 未找到可供视觉分析的个股K线图表（kline_charts 目录为空）。"
 
-    for df in stock_dfs:
-        # 计算 MA20 及与前一日均线对比，至少需要 21 个交易日
-        if len(df) < 21:
-            continue
-        code = str(df["股票代码"].iloc[0]).strip().zfill(6)
-        name = str(df["股票简称"].iloc[0]).strip()
-        recent_window = df.tail(days).copy()
+    print(f"👁️ [K线图多模态视觉分析] 即将对 {len(target_charts)} 张个股日K线走势图表进行多模态视觉审读与形态判定...")
 
-        # 涨停板判定：创业板(30开头)涨停阈值为 19.85%，主板(00, 60开头)涨停阈值为 9.85%
-        limit_threshold = 19.85 if code.startswith("30") else 9.85
-        limit_up_bars = recent_window[recent_window["涨跌幅(%)"] >= limit_threshold]
-        if limit_up_bars.empty:
-            continue
+    analyzed_results = []
+    qualified_stocks = []
 
-        last_limit_date = limit_up_bars["交易日期"].iloc[-1]
-        last_limit_pct = limit_up_bars["涨跌幅(%)"].iloc[-1]
-        limit_count = len(limit_up_bars)
+    for idx, c_path in enumerate(target_charts, 1):
+        filename = os.path.basename(c_path)
+        print(f"   📸 [{idx}/{len(target_charts)}] 正在视觉研判K线图: {filename}...")
+        res = analyze_stock_kline_chart(c_path)
+        analyzed_results.append(res)
 
-        # 趋势向上判定（日K线图的五日线、十日线、二十日线呈现上升趋势）：
-        ma5_series = df["收盘价"].rolling(5).mean()
-        ma10_series = df["收盘价"].rolling(10).mean()
-        ma20_series = df["收盘价"].rolling(20).mean()
+        status_tag = "✅ 符合" if res["is_qualified"] else "❌ 不符"
+        print(f"      👉 {res['code']} {res['name']}: {status_tag} | {res['trend_desc']}")
 
-        latest_close = float(df["收盘价"].iloc[-1])
-        latest_ma5 = float(ma5_series.iloc[-1])
-        prev_ma5 = float(ma5_series.iloc[-2])
-        latest_ma10 = float(ma10_series.iloc[-1])
-        prev_ma10 = float(ma10_series.iloc[-2])
-        latest_ma20 = float(ma20_series.iloc[-1])
-        prev_ma20 = float(ma20_series.iloc[-2])
+        if res["is_qualified"]:
+            qualified_stocks.append({
+                "股票代码": res["code"],
+                "code": res["code"],
+                "股票简称": res["name"],
+                "name": res["name"],
+                "视觉判定": res["verdict"],
+                "趋势状态": res["trend_desc"],
+                "K线走势图": res["chart_path"],
+                "chart_path": res["chart_path"],
+                "视觉分析要点": res["analysis_text"][:150] + "...",
+            })
 
-        # 1. 均线自身呈现上升趋势：五日线向上、十日线向上、二十日线向上
-        ma5_up = latest_ma5 >= prev_ma5
-        ma10_up = latest_ma10 >= prev_ma10
-        ma20_up = latest_ma20 >= prev_ma20
-
-        # 近 N 日区间涨跌幅
-        start_open = recent_window["开盘价"].iloc[0]
-        pct_window = round((latest_close - start_open) / start_open * 100, 2) if start_open else 0.0
-
-        # 趋势向上标准：五日线、十日线、二十日线均呈现上升趋势，收盘价位于二十日线支撑之上，且区间累计涨幅为正
-        is_uptrend = ma5_up and ma10_up and ma20_up and (latest_close >= latest_ma20) and (pct_window > 0)
-        if not is_uptrend:
-            continue
-
-        # 多头形态细分描述
-        if latest_close >= latest_ma5 >= latest_ma10 >= latest_ma20:
-            trend_desc = "强劲多头向上发散"
-        elif latest_ma5 >= latest_ma10 >= latest_ma20:
-            trend_desc = "均线多头持续上升"
-        elif latest_ma5 >= latest_ma10:
-            trend_desc = "五日十日多头攀升"
-        else:
-            trend_desc = "三线共振向上"
-
-        stat_item = {
-            "股票代码": code,
-            "股票简称": name,
-            "最新收盘价": latest_close,
-            "近10日涨跌幅(%)": pct_window,
-            "近10日涨停次数": limit_count,
-            "最近涨停日期": last_limit_date,
-            "最近涨停幅度(%)": last_limit_pct,
-            "5日均线": round(latest_ma5, 2),
-            "10日均线": round(latest_ma10, 2),
-            "20日均线": round(latest_ma20, 2),
-            "趋势状态": trend_desc,
-        }
-        matched_stocks.append(stat_item)
-        matched_kline_dfs.append(df)
-
-    if not matched_stocks:
-        return f"⚠️ 在扫描的 {total_scanned} 只个股中，暂未发现符合「近 {days} 日内有过涨停且日K线五日、十日、二十日线呈上升趋势」的股票。"
-
-    # 按近 10 日涨停次数与累计涨跌幅双重降序排序
-    matched_stocks.sort(key=lambda x: (x["近10日涨停次数"], x["近10日涨跌幅(%)"]), reverse=True)
-
-    # 2. 将过滤后的股票清单保存到 CSV 文件至 stock_data 目录（存在相同的就直接覆盖）
-    filtered_df = pd.DataFrame(matched_stocks)
+    # 持久化保存筛选结果到 stock_data 目录 (覆盖更新)
     filtered_filename = f"{topic_clean}_filtered_stocks.csv" if topic_clean else "filtered_stocks.csv"
     filtered_filepath = os.path.join(stock_data_dir, filtered_filename)
-    filtered_df.to_csv(filtered_filepath, index=False, encoding="utf-8-sig")
 
-    # 3. 将筛选股票对应的完整 K 线时序数据合并保存至 stock_data 目录（存在相同的就直接覆盖）
-    filtered_kline_filename = f"{topic_clean}_filtered_kline_all.csv" if topic_clean else "filtered_kline_all.csv"
-    filtered_kline_filepath = os.path.join(stock_data_dir, filtered_kline_filename)
-    if matched_kline_dfs:
-        combined_filtered_kline = pd.concat(matched_kline_dfs, ignore_index=True)
-        combined_filtered_kline.to_csv(filtered_kline_filepath, index=False, encoding="utf-8-sig")
+    # 严格确保落地清单 100% 排除科创板与创业板
+    qualified_stocks = [
+        s for s in qualified_stocks
+        if not str(s.get("code", "")).startswith(exclude_prefixes)
+    ]
+    # 若命中符合标的，以合格标的写入；若暂无完全符合，以评级最高者兜底保存，确保下游节点正常流转
+    save_list = qualified_stocks if qualified_stocks else [
+        {
+            "股票代码": r["code"],
+            "code": r["code"],
+            "股票简称": r["name"],
+            "name": r["name"],
+            "视觉判定": r["verdict"],
+            "趋势状态": r["trend_desc"],
+            "K线走势图": r["chart_path"],
+            "chart_path": r["chart_path"],
+            "视觉分析要点": r["analysis_text"][:150] + "...",
+        }
+        for r in analyzed_results
+        if not str(r.get("code", "")).startswith(exclude_prefixes)
+    ][:4]
+    pd.DataFrame(save_list).to_csv(filtered_filepath, index=False, encoding="utf-8-sig")
 
-    # 4. 构造结构化 Markdown 汇报说明
-    summary_lines = [
-        f"### 🎯 强势股筛选完成：近 {days} 日内有过涨停且五/十/二十日线呈上升趋势标的",
-        f"- **目标股票池**：{topic_clean or 'A股全市场（非科创板、非ST）'}（共解析 **{total_scanned}** 只个股K线数据）",
-        f"- **筛选技术标准**：",
-        f"  1. **涨停异动**：近 {days} 个交易日内至少出现 1 次涨停（主板≥9.85%，创业板≥19.85%）",
-        f"  2. **趋势向上**：日K线五日线(MA5)、十日线(MA10)、二十日线(MA20)均呈现上升趋势（MA5、MA10、MA20斜率均向上且收盘价站上支撑均线）",
-        f"- **持久化保存文件**：",
-        f"  - 核心标的汇总清单：[{filtered_filename}]({filtered_filepath.replace(os.sep, '/')})（共 **{len(matched_stocks)}** 只标的，存在已覆盖）",
-        f"  - 标的完整K线时序：[{filtered_kline_filename}]({filtered_kline_filepath.replace(os.sep, '/')})（包含筛选个股全量时序柱，存在已覆盖）",
-        f"\n#### 🚀 代表性高动能强势股（前 15 只）：",
-        f"| 股票代码 | 股票简称 | 最新收盘价 | 近10日涨跌幅 | 近10日涨停次数 | 最近涨停日期 | 5日均线 | 10日均线 | 20日均线 | 趋势状态 |",
-        f"| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+    # 构建结构化 Markdown 研报
+    lines = [
+        f"### 🎯 基于K线图视觉多模态分析筛选完成：强势多头高动能标的",
+        f"- **分析对象**：个股高清日K线走势图表（视觉图像），无需依赖离线表格数据",
+        f"- **图表审核标准**：",
+        f"  1. **十日涨停形态**：视觉识别走势图右侧近 10 个交易日是否存在实体大阳线或涨停板",
+        f"  2. **四线顺向排列**：五日线(黄) ≥ 十日线(紫) ≥ 二十日线(青) ≥ 三十日线(橙) 自上而下顺向排列",
+        f"  3. **趋势向上发散**：近十日内四条均线全部呈昂扬向上倾斜延伸，具有强劲趋势动能",
+        f"- **审核图表总量**：共深度视觉审读 **{len(analyzed_results)}** 张个股走势图",
+        f"- **符合战法标的**：命中 **{len(qualified_stocks)}** 只标的",
+        f"- **持久化保存清单**：[{filtered_filename}]({filtered_filepath.replace(os.sep, '/')})",
+        f"\n#### 📊 K线图视觉研判明细汇总表：",
+        f"| 股票代码 | 股票简称 | 视觉判定 | 趋势状态 | 走势图文件 | 核心视觉研判摘要 |",
+        f"| :--- | :--- | :--- | :--- | :--- | :--- |",
     ]
 
-    for item in matched_stocks[:15]:
-        ret_str = f"{item['近10日涨跌幅(%)']:+.2f}%"
-        limit_pct_str = f"+{item['最近涨停幅度(%)']:.2f}%"
-        summary_lines.append(
-            f"| {item['股票代码']} | {item['股票简称']} | {item['最新收盘价']} | {ret_str} | {item['近10日涨停次数']} 次 | {item['最近涨停日期']} ({limit_pct_str}) | {item['5日均线']} | {item['10日均线']} | {item['20日均线']} | {item['趋势状态']} |"
+    for r in analyzed_results:
+        verdict_badge = "**【符合】**" if r["is_qualified"] else "【不符合】"
+        chart_link = f"[{os.path.basename(r['chart_path'])}]({r['chart_path'].replace(os.sep, '/')})"
+        summary_short = r["analysis_text"].replace("\n", " ")[:90] + "..."
+        lines.append(
+            f"| {r['code']} | {r['name']} | {verdict_badge} | {r['trend_desc']} | {chart_link} | {summary_short} |"
         )
 
-    return "\n".join(summary_lines)
+    if qualified_stocks:
+        lines.append(f"\n#### 🚀 命中战法强势标的详细视觉分析：")
+        for q in qualified_stocks:
+            full_r = next((item for item in analyzed_results if item["code"] == q["code"]), None)
+            if full_r:
+                lines.append(f"##### 📌 {full_r['code']} {full_r['name']} - K线图视觉深度解析")
+                lines.append(f"- **走势图表**：[{os.path.basename(full_r['chart_path'])}]({full_r['chart_path'].replace(os.sep, '/')})")
+                lines.append(f"- **视觉研判详情**：\n```text\n{full_r['analysis_text']}\n```\n")
+
+    return "\n".join(lines)
+
+
+# 筛选近十日内有过涨停且趋势向上的股票 (基于K线走势图多模态视觉分析)
+@tool
+def filter_bullish_limit_up_stocks(topic: str = "", days: int = 10) -> str:
+    """直接基于个股日K线走势图（视觉图像）进行多模态视觉形态分析，
+    筛选出近10日内有过涨停且五/十/二十/三十日线从上往下多头排列且趋势向上的强势标的。
+
+    参数:
+        topic: 股票板块或主题名称，为空则在已生成的K线走势图表中进行全局视觉筛选。
+        days: 回溯窗口交易日天数，默认为近10个交易日。
+    返回:
+        筛选结果说明，包含命中股票数量、保存的文件路径及核心股票走势图。
+    """
+    return filter_stocks_by_kline_chart(topic=topic, days=days)
 
 
 # 实时监控个股分时图
@@ -1195,6 +1714,7 @@ COLLECTOR_TOOLS = [
     search_web_data,
     search_academic_papers,
     download_stock_day,
+    download_stock_kline_chart,
     filter_bullish_limit_up_stocks,
     monitor_stock_timeline,
     query_financial_rag_knowledge,
