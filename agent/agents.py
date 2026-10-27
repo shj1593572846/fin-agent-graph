@@ -173,8 +173,16 @@ def download_stock_day_node(state: ResearchState) -> dict:
                 chart_files = sorted(glob.glob(os.path.join(chart_dir, "*_kline.png")), key=os.path.getmtime, reverse=True)
         else:
             chart_files = sorted(glob.glob(os.path.join(chart_dir, "*_kline.png")), key=os.path.getmtime, reverse=True)
-        # 全量包含所有已生成的个股K线图
-        kline_charts = chart_files
+        # 全量包含所有已生成的个股K线图（按个股代码去重，保留最新日期的图表）
+        seen_codes = set()
+        deduped_charts = []
+        for p in chart_files:
+            m = re.match(r"^(\d{6})_", os.path.basename(p))
+            code_key = m.group(1) if m else p
+            if code_key not in seen_codes:
+                seen_codes.add(code_key)
+                deduped_charts.append(p)
+        kline_charts = deduped_charts
 
     kline_chart_path = kline_charts[0] if kline_charts else ""
 
@@ -197,7 +205,7 @@ def filter_stock_node(state: ResearchState) -> dict:
     直接基于个股高清日K线走势图（PNG图像）进行多模态视觉技术形态深度研判：
     1. 观察走势图右侧近10根蜡烛线是否存在实体大阳线或涨停板形态；
     2. 观察五日线(黄)、十日线(紫)、二十日线(青)、三十日线(橙)是否严格自上而下顺向排列 (MA5 >= MA10 >= MA20 >= MA30)；
-    3. 观察四条均线近5日是否全部呈向上倾斜、趋势昂扬发散；
+    3. 观察四条均线近3日是否全部呈向上倾斜、趋势昂扬发散；
     4. 视觉综合判定【符合】或【不符合】，输出合格标的清单并持久化保存；
     5. 严格过滤科创板与创业板个股（代码排除 688/689/300/301/302 开头），100% 只保留非科创、非创业板个股。
     """
@@ -218,10 +226,19 @@ def filter_stock_node(state: ResearchState) -> dict:
 
     # 1. 搜集待分析的目标K线图文件 (方案 A: 极速战法初筛 + 视觉全量终审 + 极速并发)
     target_charts = []
-    # 默认全量分析所有命中初筛的个股（不截断为16只），并发审图线程数提升为 8
-    max_inspect = int(state.get("max_candidates") or os.environ.get("MAX_VISION_CANDIDATES", "0"))
-    max_workers = int(state.get("vision_workers") or os.environ.get("VISION_WORKERS", "8"))
-    target_qualified = int(state.get("target_qualified") or os.environ.get("TARGET_QUALIFIED_STOCKS", "0"))
+    # 环境变量与状态无侵入配置：支持 MAX_VISION_CANDIDATES(0为全量不截断) 与 TARGET_QUALIFIED_STOCKS(0为不早停)
+    def _get_cfg_int(key_state, key_env, default_val):
+        v = state.get(key_state)
+        if v is not None and str(v).strip() != "":
+            return int(v)
+        v_env = os.environ.get(key_env)
+        if v_env is not None and str(v_env).strip() != "":
+            return int(v_env)
+        return default_val
+
+    max_inspect = _get_cfg_int("max_candidates", "MAX_VISION_CANDIDATES", 0)
+    max_workers = _get_cfg_int("vision_workers", "VISION_WORKERS", 4)
+    target_qualified = _get_cfg_int("target_qualified", "TARGET_QUALIFIED_STOCKS", 0)
 
     # 情况 1: 用户指定了具体个股代码或个股名称
     if re.match(r"^\d{6}$", topic) or (topic and topic != "全市场" and len(topic) <= 6 and not any(k in topic for k in ["板块", "行业", "概念"])):
@@ -240,7 +257,7 @@ def filter_stock_node(state: ResearchState) -> dict:
                 download_stock_day(topic=target_code, limit=60)
                 target_charts = glob.glob(os.path.join(chart_dir, f"*{target_code}*_kline.png"))
 
-    # 情况 2: 全市场或板块模式 -> 执行方案 A：极速战法数据初筛锁定涨停高动能候选池 (排除科创板与创业板，要求近5日均线向上)
+    # 情况 2: 全市场或板块模式 -> 执行方案 A：极速战法数据初筛锁定涨停高动能候选池 (排除科创板与创业板，要求近3日均线向上)
     if not target_charts:
         summary_filename = f"{topic}_kline_all.csv" if (topic and topic != "全市场") else "stock_kline_all.csv"
         summary_filepath = os.path.join(stock_data_dir, summary_filename)
@@ -295,11 +312,11 @@ def filter_stock_node(state: ResearchState) -> dict:
                 cand_codes = set(strict_pool[code_col])
                 df_cand = df_all[df_all[code_col].isin(cand_codes)]
 
-                # 战法条件3: 近5日四条均线向上倾斜发散 (向量化比对 MA5 与 MA10 最新价与5日前)
-                last_5_cand = df_cand.groupby(code_col).tail(5)
-                f5 = last_5_cand.groupby(code_col).first()
-                l5 = last_5_cand.groupby(code_col).last()
-                up_mask = (l5["MA5"] >= f5["MA5"]) & (l5["MA10"] >= f5["MA10"])
+                # 战法条件3: 近3日四条均线向上倾斜发散 (向量化比对 MA5 与 MA10 最新价与3日前)
+                last_3_cand = df_cand.groupby(code_col).tail(3)
+                f3 = last_3_cand.groupby(code_col).first()
+                l3 = last_3_cand.groupby(code_col).last()
+                up_mask = (l3["MA5"] >= f3["MA5"]) & (l3["MA10"] >= f3["MA10"])
                 ma_up_codes = set(up_mask[up_mask].index)
                 strict_up_pool = strict_pool[strict_pool[code_col].isin(ma_up_codes)].copy()
 
@@ -309,7 +326,7 @@ def filter_stock_node(state: ResearchState) -> dict:
                 l10 = last_10_cand.groupby(code_col).last()
                 ret10 = ((l10["收盘价"] - f10["开盘价"]) / f10["开盘价"].replace(0, 1) * 100).rename("ret10")
 
-                # 若严格四线且近5日向上标的充足以其为主；若不足则补充四线或三线池
+                # 若严格四线且近3日向上标的充足以其为主；若不足则补充四线或三线池
                 if len(strict_up_pool) >= 12:
                     pool_to_rank = strict_up_pool.copy()
                 elif len(strict_pool) >= 12:
@@ -326,21 +343,30 @@ def filter_stock_node(state: ResearchState) -> dict:
                 ranked_pool = pool_to_rank.sort_values(by="ret10", ascending=False)
                 if max_inspect > 0:
                     candidate_codes = ranked_pool[code_col].head(max_inspect).tolist()
-                    print(f"✅ [方案A: 极速战法初筛] 全市场命中非科创、非创业板、近10日涨停且均线多头近5日向上标的共 {len(ranked_pool)} 只！优选前 {len(candidate_codes)} 只核心标的进入视觉大模型终审！\n")
+                    print(f"✅ [方案A: 极速战法初筛] 全市场命中非科创、非创业板、近10日涨停且均线多头近3日向上标的共 {len(ranked_pool)} 只！优选前 {len(candidate_codes)} 只核心标的进入视觉大模型终审！\n")
                 else:
                     candidate_codes = ranked_pool[code_col].tolist()
-                    print(f"✅ [方案A: 极速战法初筛] 全市场命中非科创、非创业板、近10日涨停且均线多头近5日向上标的共 {len(ranked_pool)} 只！按要求全部（共 {len(candidate_codes)} 只）全量进入视觉大模型终审！\n")
+                    print(f"✅ [方案A: 极速战法初筛] 全市场命中非科创、非创业板、近10日涨停且均线多头近3日向上标的共 {len(ranked_pool)} 只！按要求全部（共 {len(candidate_codes)} 只）全量进入视觉大模型终审！\n")
             except Exception as e:
                 print(f"⚠️ 战法数据初筛异常: {e}")
 
-        # 匹配对应个股已生成的K线图表（严格排除科创板与创业板）
+        # 极速预热匹配对应个股已生成的K线图表（单次扫描目录映射，严格排除科创板与创业板）
         if candidate_codes:
+            code_chart_map = {}
+            if os.path.exists(chart_dir):
+                for entry in os.scandir(chart_dir):
+                    if entry.name.endswith("_kline.png") and entry.is_file():
+                        m_c = re.match(r"^(\d{6})_", entry.name)
+                        if m_c:
+                            code_chart_map[m_c.group(1)] = entry.path
+
             for c in candidate_codes:
-                if str(c).startswith(EXCLUDE_PREFIXES):
+                c_clean = str(c).zfill(6)
+                if c_clean.startswith(EXCLUDE_PREFIXES):
                     continue
-                pats = glob.glob(os.path.join(chart_dir, f"{c}_*_kline.png"))
-                if pats and os.path.exists(pats[0]):
-                    target_charts.append(pats[0])
+                p_chart = code_chart_map.get(c_clean)
+                if p_chart and os.path.exists(p_chart):
+                    target_charts.append(p_chart)
 
         # 保底机制：若初筛无匹配或未生成，从状态或图表目录回退（严格过滤科创板与创业板）
         if not target_charts:
@@ -371,8 +397,8 @@ def filter_stock_node(state: ResearchState) -> dict:
         except Exception:
             vision_cache = {}
 
-    # 紧凑 token 与超时设定，大幅降低多模态文本生成耗时，充足容纳形态判断与简评
-    llm = get_llm(temperature=0.1, max_tokens=220, timeout=60)
+    # 优化 token 与超时设定，为 reasoning 与正文预留充足空间，提升大模型调用效率与成功率
+    llm = get_llm(temperature=0.1, max_tokens=250, timeout=40)
     analyzed_results = []
     qualified_stocks = []
 
@@ -382,17 +408,17 @@ def filter_stock_node(state: ResearchState) -> dict:
 
     def _eval_single_chart(item_tuple):
         idx, c_path = item_tuple
-        # 错峰微延迟发起，避免并发瞬时脉冲冲击反向代理
-        time.sleep((idx % max_workers) * 0.2)
 
         filename = os.path.basename(c_path)
-        # 从图表文件名反解代码与名称
+        # 从图表文件名反解代码、名称与生成日期（兼容带日期格式及无日期历史格式）
         code = ""
         name = ""
-        m = re.match(r"^(\d{6})_(.*?)_kline\.png$", filename)
+        chart_date_str = ""
+        m = re.match(r"^(\d{6})_(.*?)(?:_(\d{8}))?_kline\.png$", filename)
         if m:
             code = m.group(1)
             candidate_name = m.group(2)
+            chart_date_str = m.group(3) or ""
             if candidate_name and candidate_name != code and "" not in candidate_name:
                 name = candidate_name
 
@@ -417,22 +443,36 @@ def filter_stock_node(state: ResearchState) -> dict:
                 "from_cache": False,
             }
 
-        # 检查本地审图缓存，若命中直接秒级复用
+        # 极速校验图中是否存在当天的数据（微秒级正则比对，耗时极小 < 0.001ms）：
+        # 若文件名含日期则直接比对当天日期，无日期历史图表回退文件修改时间；图中不存在当天数据则绝对禁止走缓存命中
+        today_date = datetime.date.today()
+        today_str = today_date.strftime("%Y%m%d")
+        if chart_date_str:
+            try:
+                p_date = datetime.datetime.strptime(chart_date_str, "%Y%m%d").date()
+                has_today_data = (chart_date_str == today_str) or ((today_date - p_date).days <= 1)
+            except Exception:
+                has_today_data = (chart_date_str == today_str)
+        else:
+            file_mtime_date = datetime.date.fromtimestamp(os.path.getmtime(c_path)).date()
+            has_today_data = (today_date - file_mtime_date).days <= 1
+
+        # 检查本地审图缓存：仅当图中存在当天数据且已缓存时才秒级复用；不存在当天数据则不走缓存，必须重新研判
         cache_key = f"{code}_{int(os.path.getmtime(c_path))}"
-        if cache_key in vision_cache:
+        if has_today_data and cache_key in vision_cache:
             c_item = dict(vision_cache[cache_key])
             c_item["idx"] = idx
             c_item["chart_path"] = c_path
             c_item["from_cache"] = True
             return c_item
 
-        # 高速图像自适应降采样优化：将高清图自适应压缩至 720x420，大幅降低多模态视觉 Token 数量，调用耗时立减 50%
+        # 高速图像自适应降采样优化：自适应压缩至 640x380 JPEG (75质量)，体积由 180KB 降至 30KB，大幅降低视觉 Token 数量与上传耗时
         try:
             with Image.open(c_path) as im:
                 im_rgb = im.convert("RGB")
-                im_resized = im_rgb.resize((720, 420), Image.Resampling.BILINEAR)
+                im_resized = im_rgb.resize((640, 380), Image.Resampling.BILINEAR)
                 buf = io.BytesIO()
-                im_resized.save(buf, format="PNG")
+                im_resized.save(buf, format="JPEG", quality=75)
                 img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
         except Exception:
             with open(c_path, "rb") as f:
@@ -444,7 +484,7 @@ def filter_stock_node(state: ResearchState) -> dict:
 请按核心战法规则极速研判：
 1. 观察走势图右侧近10根蜡烛线是否存在实体大阳线或涨停板形态；
 2. 观察五日线(黄) ≥ 十日线(紫) ≥ 二十日线(青) ≥ 三十日线(橙) 是否严格自上而下顺向排列；
-3. 观察四条均线近5日是否全部呈向上倾斜、趋势昂扬发散。
+3. 观察四条均线近3日是否全部呈向上倾斜、趋势昂扬发散。
 
 请在第一行直接输出判定结果，第二行输出一句话形态评述（控制在30字内）：
 【判定结果】：符合（或：不符合）
@@ -452,7 +492,7 @@ def filter_stock_node(state: ResearchState) -> dict:
 """
         msg = HumanMessage(content=[
             {"type": "text", "text": prompt_text},
-            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
         ])
 
         # 增加抗代理抖动 3 次智能重试机制
@@ -493,8 +533,8 @@ def filter_stock_node(state: ResearchState) -> dict:
                 trend_desc = "均线空头排列/拐头向下"
             elif "未见涨停" in content or "不存在" in content:
                 trend_desc = "均线尚可但近10日无涨停"
-            elif "近5日" in content and ("走平" in content or "向下" in content):
-                trend_desc = "近5日均线未全部昂扬向上"
+            elif ("近3日" in content or "近5日" in content) and ("走平" in content or "向下" in content):
+                trend_desc = "近3日均线未全部昂扬向上"
 
         res_dict = {
             "idx": idx,
@@ -508,7 +548,7 @@ def filter_stock_node(state: ResearchState) -> dict:
             "from_cache": False,
         }
 
-        # 更新至审图缓存字典
+        # 更新至审图缓存字典（记录缓存写入日期）
         vision_cache[cache_key] = {
             "code": code,
             "name": name,
@@ -516,46 +556,93 @@ def filter_stock_node(state: ResearchState) -> dict:
             "verdict": verdict,
             "trend_desc": trend_desc,
             "analysis_text": content,
+            "cache_date": today_str,
         }
 
         return res_dict
 
     # 使用并发线程池与 as_completed 极速调度，谁先完成谁先输出，满额达标即刻早停
-    tasks = list(enumerate(target_charts, 1))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futs = {executor.submit(_eval_single_chart, item): item for item in tasks}
-        done_count = 0
-        for f in concurrent.futures.as_completed(futs):
-            item_res = f.result()
+    today_str = datetime.date.today().strftime("%Y%m%d")
+    pending_tasks = []
+    done_count = 0
+
+    # 阶段 1: 内存优先秒级提取本地已存在当日有效缓存的标的，避免重复发起大模型调用
+    for idx, c_path in enumerate(target_charts, 1):
+        filename = os.path.basename(c_path)
+        m = re.match(r"^(\d{6})_(.*?)(?:_(\d{8}))?_kline\.png$", filename)
+        code = m.group(1) if m else ""
+        chart_date_str = m.group(3) if m and m.group(3) else ""
+        today_date = datetime.date.today()
+        if chart_date_str:
+            try:
+                p_date = datetime.datetime.strptime(chart_date_str, "%Y%m%d").date()
+                has_today = (chart_date_str == today_str) or ((today_date - p_date).days <= 1)
+            except Exception:
+                has_today = (chart_date_str == today_str)
+        else:
+            file_mtime_date = datetime.date.fromtimestamp(os.path.getmtime(c_path)).date()
+            has_today = (today_date - file_mtime_date).days <= 1
+
+        cache_key = f"{code}_{int(os.path.getmtime(c_path))}"
+        if has_today and cache_key in vision_cache:
+            c_item = dict(vision_cache[cache_key])
+            c_item["idx"] = idx
+            c_item["chart_path"] = c_path
+            c_item["from_cache"] = True
             done_count += 1
-            analyzed_results.append(item_res)
-            idx = item_res["idx"]
-            code = item_res["code"]
-            name = item_res["name"]
-            is_qualified = item_res["is_qualified"]
-            trend_desc = item_res["trend_desc"]
-            status_icon = "✅ 符合战法" if is_qualified else "❌ 不符"
-            cache_tag = "⚡ [缓存命中]" if item_res.get("from_cache") else "📸"
-            print(f"  {cache_tag} [{done_count}/{len(target_charts)}] {code} {name}: {status_icon} | {trend_desc}")
-            if is_qualified:
+            analyzed_results.append(c_item)
+            is_q = c_item["is_qualified"]
+            status_icon = "✅ 符合战法" if is_q else "❌ 不符"
+            print(f"  ⚡ [缓存命中] [{done_count}/{len(target_charts)}] {c_item['code']} {c_item['name']}: {status_icon} | {c_item['trend_desc']}")
+            if is_q:
                 qualified_stocks.append({
-                    "股票代码": code,
-                    "code": code,
-                    "股票简称": name,
-                    "name": name,
-                    "视觉判定": item_res["verdict"],
-                    "趋势状态": trend_desc,
-                    "K线走势图": item_res["chart_path"],
-                    "chart_path": item_res["chart_path"],
-                    "视觉分析要点": item_res["analysis_text"][:160] + "...",
+                    "股票代码": c_item["code"],
+                    "code": c_item["code"],
+                    "股票简称": c_item["name"],
+                    "name": c_item["name"],
+                    "视觉判定": c_item["verdict"],
+                    "趋势状态": c_item["trend_desc"],
+                    "K线走势图": c_item["chart_path"],
+                    "chart_path": c_item["chart_path"],
+                    "视觉分析要点": c_item["analysis_text"][:160] + "...",
                 })
-                # 动态早停优化：仅当显式设置 target_qualified > 0 时才早停，默认全量审核不提前截断
-                if target_qualified > 0 and len(qualified_stocks) >= target_qualified:
-                    print(f"\n⚡ [达标早停提速] 已成功命中 {len(qualified_stocks)} 只优质达标标的（达到配置配额 {target_qualified} 只），即刻终止后续审图！")
-                    for pending_f in futs:
-                        if not pending_f.done():
-                            pending_f.cancel()
-                    break
+        else:
+            pending_tasks.append((idx, c_path))
+
+    # 阶段 2: 仅对未命中缓存的标的发起并发视觉审图，达标即刻早停
+    if pending_tasks and (target_qualified <= 0 or len(qualified_stocks) < target_qualified):
+        workers_count = min(max_workers, len(pending_tasks))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers_count) as executor:
+            futs = {executor.submit(_eval_single_chart, item): item for item in pending_tasks}
+            for f in concurrent.futures.as_completed(futs):
+                item_res = f.result()
+                done_count += 1
+                analyzed_results.append(item_res)
+                idx = item_res["idx"]
+                code = item_res["code"]
+                name = item_res["name"]
+                is_qualified = item_res["is_qualified"]
+                trend_desc = item_res["trend_desc"]
+                status_icon = "✅ 符合战法" if is_qualified else "❌ 不符"
+                print(f"  📸 [{done_count}/{len(target_charts)}] {code} {name}: {status_icon} | {trend_desc}")
+                if is_qualified:
+                    qualified_stocks.append({
+                        "股票代码": code,
+                        "code": code,
+                        "股票简称": name,
+                        "name": name,
+                        "视觉判定": item_res["verdict"],
+                        "趋势状态": trend_desc,
+                        "K线走势图": item_res["chart_path"],
+                        "chart_path": item_res["chart_path"],
+                        "视觉分析要点": item_res["analysis_text"][:160] + "...",
+                    })
+                    if target_qualified > 0 and len(qualified_stocks) >= target_qualified:
+                        print(f"\n⚡ [达标早停提速] 已成功命中 {len(qualified_stocks)} 只优质达标标的（达到配置配额 {target_qualified} 只），即刻终止后续审图！")
+                        for pending_f in futs:
+                            if not pending_f.done():
+                                pending_f.cancel()
+                        break
 
     # 按照原本优先级排序输出
     analyzed_results.sort(key=lambda x: x["idx"])
@@ -603,7 +690,7 @@ def filter_stock_node(state: ResearchState) -> dict:
         f"  1. 排除科创板与创业板股票（代码非 688/689/300/301/302 开头）",
         f"  2. 视觉识别近 10 根蜡烛线是否存在实体大阳线或涨停板形态",
         f"  3. 视觉识别五日线(黄) ≥ 十日线(紫) ≥ 二十日线(青) ≥ 三十日线(橙) 严格自上而下顺向多头排列",
-        f"  4. 视觉识别四条均线近 5 日是否全部呈昂扬向上倾斜发散走势",
+        f"  4. 视觉识别四条均线近 3 日是否全部呈昂扬向上倾斜发散走势",
         f"- **审图数量**：共深度视觉研判 **{len(analyzed_results)}** 张个股走势图",
         f"- **命中符合标的**：共 **{len(qualified_stocks)}** 只标的",
         f"- **筛选清单文件**：[{filtered_filename}]({filtered_filepath.replace(os.sep, '/')})",

@@ -12,6 +12,9 @@ from typing import Optional, Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # 确保在 Windows 环境下优先启用 ProactorEventLoop，支持异步管道通信与子进程创建
 if sys.platform == "win32":
