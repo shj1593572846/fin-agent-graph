@@ -29,6 +29,7 @@ from tools import (
     analyze_stock_kline_chart,
     filter_stocks_by_kline_chart,
     filter_bullish_limit_up_stocks,
+    verify_and_patch_previous_day_kline,
     _resolve_single_stock_name,
     search_web_data,
 )
@@ -184,6 +185,10 @@ def download_stock_day_node(state: ResearchState) -> dict:
                 deduped_charts.append(p)
         kline_charts = deduped_charts
 
+    # 校验个股K线图是否有前一天的K线柱，若没有则自动拉取补齐并重新渲染生成K线走势图
+    if kline_charts:
+        kline_charts = verify_and_patch_previous_day_kline(kline_charts, topic=topic)
+
     kline_chart_path = kline_charts[0] if kline_charts else ""
 
     elapsed = time.time() - t_start
@@ -226,6 +231,7 @@ def filter_stock_node(state: ResearchState) -> dict:
 
     # 1. 搜集待分析的目标K线图文件 (方案 A: 极速战法初筛 + 视觉全量终审 + 极速并发)
     target_charts = []
+    code_to_name = {}
     # 环境变量与状态无侵入配置：支持 MAX_VISION_CANDIDATES(0为全量不截断) 与 TARGET_QUALIFIED_STOCKS(0为不早停)
     def _get_cfg_int(key_state, key_env, default_val):
         v = state.get(key_state)
@@ -936,14 +942,11 @@ def fetch_grid_timeline_data(query: str = "") -> str:
                             break
 
                 score = (1 if above_ratio >= 80 else 0) + (1 if min_bias >= -0.25 else 0) + (1 if shrink_ratio >= 60 else 0) + (1 if has_rebound_volume else 0)
-                # 均线收复规则：均线收复速度为无需收回的视为不达标；未收回或超过2分钟收回均视为不达标
-                if recovery_time == "无需收回":
-                    score = 0
-                    tag = "❌    【无需收回-不达标】"
-                elif recovery_time == "未收回":
+                # 均线收复规则：未收回视为不达标；超过2分钟收回降级；无需收回(全程在均线上方)或1~2分钟内收回均视为符合战法要求
+                if recovery_time == "未收回":
                     score = 0
                     tag = "❌    【均线下破】"
-                elif recovery_time not in ("1分钟收回", "2分钟收回"):
+                elif recovery_time not in ("1分钟收回", "2分钟收回", "无需收回"):
                     score = min(score, 1)
                     tag = "❌    【收复过慢-不达标】"
                 else:
@@ -1025,7 +1028,7 @@ def analyze_grid_agent_node(state: ResearchState) -> dict:
         f"{user_memory_extra}"
         "当前系统已自动将监控标的分散在多个16宫格网页窗口（每个窗口最多16只标的）。\n"
         "你必须先调用 fetch_grid_timeline_data 工具依次轮询抓取所有16宫格网页窗口 (/?page=1, /?page=2...) 的实时早盘分时量价数据。\n"
-        "然后基于工具轮询返回的客观量化特征（均线上方占比、最低点偏离、缩量频率、反弹放量），系统分析跨窗口哪些个股在 9:30 到 9:35 期间符合『回踩不跌破分时均线、回调抛压逐步变小、下跌之后快速收回、有资金主动承接、放量承接、均线收复速度在1、2分钟内、均线收复速度为无需收回的视为不符合要求』，记录触发时间，并指出典型的弱势反面个股。\n"
+        "然后基于工具轮询返回的客观量化特征（均线上方占比、最低点偏离、缩量频率、反弹放量），系统分析跨窗口哪些个股在 9:30 到 9:35 期间符合『回踩不跌破分时均线、回调抛压逐步变小、下跌之后快速收回、有资金主动承接、放量承接、均线收复速度在1、2分钟内或全程处于均线上方无需收回的均符合要求』，记录触发时间，并指出典型的弱势反面个股。\n"
         "输出必须包含五个模块：\n"
         "1. 🏆【强势回踩承接 - 达标个股精选】（注明个股所属网页窗口编号，如窗口1/窗口2）\n"
         "2. ⚠️【反面弱势案例剖析】（注明个股所属网页窗口编号）\n"
@@ -1046,7 +1049,7 @@ def analyze_grid_agent_node(state: ResearchState) -> dict:
         print("🤖 [Node4 Agent] 正在调用 fetch_grid_timeline_data 工具轮询各16宫格网页窗口分时数据并进行智能研判...")
         query = (
             "请先调用 fetch_grid_timeline_data 工具依次轮询抓取所有16宫格网页窗口中所有标在 09:30 - 09:35 的早盘分时量化数据，"
-            "然后跨窗口统筹筛查符合『回踩不跌破分时均线，回调抛压逐步变小，下跌之后可以快速收回，有资金主动承接,放量承接,均线收复速度在1、2分钟内,均线收复速度为无需收回的视为不符合要求』的强势标的，并给出专业研报与向消息面 Agent 的通信指示。"
+            "然后跨窗口统筹筛查符合『回踩不跌破分时均线，回调抛压逐步变小，下跌之后可以快速收回，有资金主动承接,放量承接,均线收复速度在1、2分钟内或全程处于均线上方（无需收回）均符合要求』的强势标的，并给出专业研报与向消息面 Agent 的通信指示。"
         )
         resp = agent.invoke({"messages": [HumanMessage(content=query)]})
         for m in reversed(resp.get("messages", [])):
@@ -1120,24 +1123,24 @@ def analyze_grid_agent_node(state: ResearchState) -> dict:
                     break
 
         score = (1 if above_ratio >= 80 else 0) + (1 if min_bias >= -0.25 else 0) + (1 if shrink_ratio >= 60 else 0) + (1 if has_rebound_volume else 0)
-        # 均线收复规则：均线收复速度为无需收回的视为不达标；未收回或超过2分钟收回均视为不达标
-        if recovery_time == "无需收回":
-            score = 0
-            tag = "❌    【无需收回-不达标】"
-        elif recovery_time == "未收回":
+        # 均线收复规则：未收回视为不达标；超过2分钟收回降级；无需收回(全程在均线上方)或1~2分钟内收回均视为符合战法要求
+        if recovery_time == "未收回":
             score = 0
             tag = "❌    【均线下破】"
-        elif recovery_time not in ("1分钟收回", "2分钟收回"):
+        elif recovery_time not in ("1分钟收回", "2分钟收回", "无需收回"):
             score = min(score, 1)
             tag = "❌    【收复过慢-不达标】"
         else:
             tag = "⭐⭐⭐【强力符合】" if score >= 3 else ("❌    【指标偏弱】" if score <= 1 else "⭐⭐  【部分符合】")
         reb_str = "放量承接" if has_rebound_volume else "温和承接"
 
-        # 精确计算 09:30 - 09:35 盘中触发量化特征条件的时间点（仅针对达标且在1、2分钟内收复的标的）
+        # 精确计算 09:30 - 09:35 盘中触发量化特征条件的时间点（达标标的：1、2分钟内收复 或 全程处于均线上方无需收回）
         trigger_time = "未达标"
-        if score >= 2 and recovery_time in ("1分钟收回", "2分钟收回"):
-            trigger_time = reclaim_time or (rebound_bars[0].get("time", "09:35") if rebound_bars else min_bar.get("time", "09:35"))
+        if score >= 2:
+            if recovery_time in ("1分钟收回", "2分钟收回"):
+                trigger_time = reclaim_time or (rebound_bars[0].get("time", "09:35") if rebound_bars else min_bar.get("time", "09:35"))
+            elif recovery_time == "无需收回":
+                trigger_time = min_bar.get("time", "09:30")
 
         evaluated_stocks.append({
             "code": code,
@@ -1205,10 +1208,10 @@ def analyze_grid_agent_node(state: ResearchState) -> dict:
         weak_sample = [f"【{s['name']}】({s['code']})" for s in break_stocks[:5]]
         print(f"❌ 【均线下破弱势标的 (反面案例)】: {'、'.join(weak_sample)}{' 等' if len(break_stocks) > 5 else ''}")
 
-    unneeded_stocks = [s for s in evaluated_stocks if s["recovery_time"] == "无需收回"]
-    if unneeded_stocks:
-        unneeded_sample = [f"【{s['name']}】({s['code']})" for s in unneeded_stocks[:5]]
-        print(f"⚪ 【无需收回标的 (未跌破均线/不达标)】: {'、'.join(unneeded_sample)}{' 等' if len(unneeded_stocks) > 5 else ''}")
+    above_ma_stocks = [s for s in qualified_stocks if s["recovery_time"] == "无需收回"]
+    if above_ma_stocks:
+        above_sample = [f"【{s['name']}】({s['code']})" for s in above_ma_stocks[:5]]
+        print(f"🛡️ 【全程均线上方达标标的 (无需收回/符合战法)】: {'、'.join(above_sample)}{' 等' if len(above_ma_stocks) > 5 else ''}")
 
     print("=" * 96 + "\n")
 
@@ -1228,7 +1231,7 @@ def analyze_grid_agent_node(state: ResearchState) -> dict:
             )
         quant_report_lines.append("")
     else:
-        quant_report_lines.append("⚠️ 本轮量化筛选中暂无符合『1~2分钟内收复均线 且 score>=2』的标的。\n")
+        quant_report_lines.append("⚠️ 本轮量化筛选中暂无符合『无需收回或1~2分钟内收复均线 且 score>=2』的标的。\n")
 
     if break_stocks:
         quant_report_lines.append("### ⚠️【反面弱势案例剖析（均线下破未收回/坚决回避）】")
@@ -1236,10 +1239,10 @@ def analyze_grid_agent_node(state: ResearchState) -> dict:
             quant_report_lines.append(f"- **{s['name']}** (`{s['code']}`): 跌破分时均线且未能收复，坚决回避")
         quant_report_lines.append("")
 
-    if unneeded_stocks:
-        quant_report_lines.append("### ⚪【无需收回标的（早盘未跌破分时均线/不符收复战法）】")
-        for s in unneeded_stocks[:5]:
-            quant_report_lines.append(f"- **{s['name']}** (`{s['code']}`): 早盘未破均线，未现回踩收复动作，不纳入本次达标池")
+    if above_ma_stocks:
+        quant_report_lines.append("### 🛡️【全程均线上方强势标的（早盘未破分时均线/无需收回·达标入选）】")
+        for s in above_ma_stocks[:5]:
+            quant_report_lines.append(f"- **{s['name']}** (`{s['code']}`): 早盘走势坚挺全程处于分时均线上方，无需收回，完全符合强势战法要求入选达标池")
         quant_report_lines.append("")
 
     quant_summary = "\n".join(quant_report_lines)
@@ -1255,7 +1258,7 @@ def analyze_grid_agent_node(state: ResearchState) -> dict:
     target_str = f"（重点多头标的：{', '.join(target_names)}）" if target_names else ""
     comm_to_node5 = (
         f"【通信：node4 -> node5】跨窗口技术量化轮询初筛已完成！大模型已通过 fetch_grid_timeline_data 工具轮询了所有16宫格网页窗口，"
-        f"锁定了在 09:30 - 09:35 呈现早盘回踩不跌破分时均线、缩量回调、主动资金回拉放量承接的多头标的{target_str}，以及均线下破的弱势标的。"
+        f"锁定了在 09:30 - 09:35 呈现早盘全程处于分时均线上方（无需收回）或回踩后1-2分钟快速收复、缩量回调、主动资金回拉放量承接的多头标的{target_str}，以及均线下破的弱势标的。"
         f"请消息面 Agent 根据最新 A 股实时快讯与权威财经头条，从全市场宏观大盘情绪、政策风向与热点题材层面研判当前做多环境与风口催化！"
     )
 

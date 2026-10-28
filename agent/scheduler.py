@@ -269,6 +269,18 @@ class TaskScheduler:
                         cur.execute("SELECT `id`, `name`, `python_script`, `cron_expr`, `enabled`, `last_run_time`, `last_status`, `last_result`, `next_run_time` FROM `sys_cron_task` ORDER BY `id` ASC;")
                         rows = cur.fetchall()
 
+                    # 检查既有表中是否缺少 Node 1+2 每日初筛定时任务，若无则平滑增补
+                    cur.execute("SELECT COUNT(*) FROM `sys_cron_task` WHERE `python_script` = 'agent/run_nodes_1_2.py';")
+                    if cur.fetchone()[0] == 0:
+                        cur.execute("""
+                        INSERT INTO `sys_cron_task` 
+                            (`name`, `python_script`, `cron_expr`, `enabled`, `last_status`, `last_result`)
+                        VALUES 
+                            ('每日日K下载与视觉选股初筛 (Node 1+2)', 'agent/run_nodes_1_2.py', '30 1 * * *', 1, 'idle', '每天凌晨 01:30 自动调用执行 Node 1 (下载日线并生成全量K线图) 和 Node 2 (视觉多模态战法初筛过滤)');
+                        """)
+                        cur.execute("SELECT `id`, `name`, `python_script`, `cron_expr`, `enabled`, `last_run_time`, `last_status`, `last_result`, `next_run_time` FROM `sys_cron_task` ORDER BY `id` ASC;")
+                        rows = cur.fetchall()
+
                 for r in rows:
                     t_id = int(r[0])
                     task = {
@@ -550,6 +562,9 @@ class TaskScheduler:
                 env = os.environ.copy()
                 env["PYTHONIOENCODING"] = "utf-8"
                 env["PYTHONUNBUFFERED"] = "1"
+                run_kwargs = {}
+                if sys.platform == "win32" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+                    run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
                 proc = subprocess.run(
                     cmd,
                     cwd=_PROJECT_ROOT,
@@ -558,7 +573,8 @@ class TaskScheduler:
                     encoding="utf-8",
                     errors="replace",
                     env=env,
-                    timeout=600,
+                    timeout=1800,
+                    **run_kwargs,
                 )
                 stdout_str = (proc.stdout or "").strip()
                 stderr_str = (proc.stderr or "").strip()

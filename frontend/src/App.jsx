@@ -1632,6 +1632,28 @@ export default function App() {
                     >
                       🚀 agent/main.py (选股流水线)
                     </button>
+                    <button
+                      type="button"
+                      className={`script-preset-btn ${
+                        taskFormData.python_script === 'agent/run_nodes_1_2.py' ? 'active' : ''
+                      }`}
+                      onClick={() =>
+                        setTaskFormData({
+                          ...taskFormData,
+                          python_script: 'agent/run_nodes_1_2.py',
+                          name:
+                            !taskFormData.name || taskFormData.name === 'A股收盘价自动同步' || taskFormData.name === '早盘全市场智能选股'
+                              ? '每日日K下载与视觉选股初筛 (Node 1+2)'
+                              : taskFormData.name,
+                          cron_expr:
+                            !taskFormData.cron_expr || taskFormData.cron_expr === '10 15 * * 1-5' || taskFormData.cron_expr === '30 9 * * 1-5'
+                              ? '30 1 * * *'
+                              : taskFormData.cron_expr,
+                        })
+                      }
+                    >
+                      ⚡ agent/run_nodes_1_2.py (Node 1+2 日K下载与视觉初筛)
+                    </button>
                   </div>
                   <input
                     type="text"
@@ -1657,6 +1679,17 @@ export default function App() {
                     3. cron表达式 <span className="req">*</span>:
                   </label>
                   <div className="cron-presets-group">
+                    <button
+                      type="button"
+                      className={`cron-preset-btn ${
+                        taskFormData.cron_expr === '30 1 * * *' ? 'active' : ''
+                      }`}
+                      onClick={() =>
+                        setTaskFormData({ ...taskFormData, cron_expr: '30 1 * * *' })
+                      }
+                    >
+                      🌙 30 1 * * * (每天 01:30)
+                    </button>
                     <button
                       type="button"
                       className={`cron-preset-btn ${

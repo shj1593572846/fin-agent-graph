@@ -198,7 +198,7 @@ def fetch_batch_realtime_bars(codes: list[str]) -> dict[str, dict]:
 
     def _fetch_chunk(sub_codes):
         bars = {}
-        syms = [("sh" if c.startswith(("6", "9")) else "sz") + c for c in sub_codes]
+        syms = [("bj" if c.startswith(("4", "8", "920")) else ("sh" if c.startswith(("6", "9")) else "sz")) + c for c in sub_codes]
         url = "http://qt.gtimg.cn/q=" + ",".join(syms)
         try:
             resp = requests.get(url, timeout=5)
@@ -256,8 +256,8 @@ def fetch_batch_realtime_bars(codes: list[str]) -> dict[str, dict]:
     return all_bars
 
 
-def append_today_realtime_data_if_missing(df: pd.DataFrame) -> pd.DataFrame:
-    """检查 DataFrame 中是否包含今日最新分时/日K行情数据。若缺失则全自动并发拉取最新行情并追加合并，重新计算均线指标。"""
+def append_today_realtime_data_if_missing(df: pd.DataFrame, force_refresh: bool = False) -> pd.DataFrame:
+    """检查并更新 DataFrame 中今日最新分时/日K行情数据。若缺失或需刷新，全自动并发拉取最新行情并追加/覆盖合并，重新计算均线指标。"""
     if df.empty or ("股票代码" not in df.columns and "code" not in df.columns):
         return df
 
@@ -274,12 +274,16 @@ def append_today_realtime_data_if_missing(df: pd.DataFrame) -> pd.DataFrame:
         today_rows = df[df["交易日期"] == today_str]
         existing_today = set(today_rows[code_col].astype(str).str.zfill(6))
 
-    missing_codes = [c for c in unique_codes if c not in existing_today]
-    if not missing_codes:
+    if force_refresh:
+        target_codes = unique_codes
+    else:
+        target_codes = [c for c in unique_codes if c not in existing_today]
+
+    if not target_codes:
         return df
 
-    print(f"🔄 [今日分时实时同步] 检测到 {len(missing_codes)} 只标的尚无今日({today_str})最新行情分时数据，正在并发拉取并自动追加合并...")
-    today_bars = fetch_batch_realtime_bars(missing_codes)
+    print(f"🔄 [今日分时实时同步] 正在为 {len(target_codes)} 只标的拉取今日({today_str})最新行情分时数据并自动合并...")
+    today_bars = fetch_batch_realtime_bars(target_codes)
     if not today_bars:
         return df
 
@@ -287,7 +291,7 @@ def append_today_realtime_data_if_missing(df: pd.DataFrame) -> pd.DataFrame:
     for c_code, bar in today_bars.items():
         if bar.get("收盘价", 0) > 0:
             bar_copy = dict(bar)
-            bar_copy["交易日期"] = today_str
+            bar_copy["交易日期"] = bar.get("交易日期") or today_str
             new_rows.append(bar_copy)
 
     if not new_rows:
@@ -303,24 +307,25 @@ def append_today_realtime_data_if_missing(df: pd.DataFrame) -> pd.DataFrame:
     combined.reset_index(drop=True, inplace=True)
 
     combined = _ensure_kline_ma_columns(combined)
-    print(f"✅ [今日分时合并完成] 成功为 {len(new_rows)} 只标的追加今日({today_str})最新行情分时数据，均线系统已全量刷新！")
+    print(f"✅ [今日分时合并完成] 成功为 {len(new_rows)} 只标的追加/刷新今日({today_str})最新行情分时数据，均线系统已全量刷新！")
     return combined
 
 
-def render_stock_kline_chart(df: pd.DataFrame, code: str, name: str = "", output_dir: str = None) -> str:
+def render_stock_kline_chart(df: pd.DataFrame, code: str, name: str = "", output_dir: str = None, force_refresh: bool = False) -> str:
     """
     根据个股日K线时序数据渲染并保存包含五日线(MA5)、十日线(MA10)、二十日线(MA20)、三十日线(MA30)的高清K线走势图。
     使用 FigureCanvasAgg 纯底层绘图，线程安全、极速并发、支持秒级本地缓存复用。
 
-    图表文件名追加生成日期 YYYYMMDD (例如 000001_平安银行_20261027_kline.png)：
-    - 当节点运行日期 <= 生成日期时，重新生成替换对应个股K线图；
-    - 当节点运行日期 > 生成日期时，视为已经下载了最新的个股K线图，就无需再下载/重新绘制，秒级复用。
+    图表文件名追加生成日期 YYYYMMDD (例如 000001_平安银行_20261028_kline.png)：
+    - 当已有图表生成日期 >= 数据最新日期且 >= 今日日期时，直接秒级复用；
+    - 当已有图表生成日期早于数据最新日期/今日日期（历史旧图，缺失最新K线）或强制刷新时，重新生成替换对应个股K线图。
 
     参数:
         df: 个股K线时序 DataFrame
         code: 股票代码
         name: 股票简称
         output_dir: 自定义输出目录（默认输出到项目根目录下 kline_charts/）
+        force_refresh: 是否强制重新绘制，默认 False
     返回:
         生成的图表本地绝对路径（若绘图失败则返回空字符串）
     """
@@ -340,7 +345,7 @@ def render_stock_kline_chart(df: pd.DataFrame, code: str, name: str = "", output
 
     # 检索是否已有该个股的历史/当日图表（必须匹配带 8 位生成日期的文件名；无日期历史图表不参与复用，强制重新生成为新格式）
     existing_charts = glob.glob(os.path.join(chart_dir, f"{code_clean}_*_kline.png"))
-    if existing_charts:
+    if existing_charts and not force_refresh:
         best_path = None
         best_date = None
         for p in existing_charts:
@@ -356,22 +361,30 @@ def render_stock_kline_chart(df: pd.DataFrame, code: str, name: str = "", output
                 except Exception:
                     pass
 
-        # 规则：当节点运行日期 > 生成日期时，视为已经下载了最新的个股K线图，无需再下载与重绘，直接秒级复用
-        if best_path and best_date and today_date > best_date:
-            return best_path
+        # 获取数据源中的最新交易日期
+        latest_bar_date = str(df["交易日期"].iloc[-1]).split()[0] if "交易日期" in df.columns and not df.empty else ""
+        latest_bar_d = datetime.datetime.strptime(latest_bar_date, "%Y-%m-%d").date() if latest_bar_date else today_date
 
-    # 当节点运行日期 <= 生成日期（或未生成过带日期的新格式）：执行重新生成并替换
+        # 规则：只有当已有图表生成日期 >= 数据最新日期 并且 >= 今日日期时（即当天已生成过包含最新数据的图表），才直接秒级复用
+        # 若已有图表生成日期早于今日/最新数据日期 (如 20261027 早于 20261028)，则视为过期图表，必须重新渲染包含今日最新K线的走势图！
+        if best_path and best_date:
+            if best_date >= latest_bar_d and best_date >= today_date:
+                return best_path
+
+    # 当未生成过或已有图表已过期：执行重新生成并替换
     chart_df = df.copy()
 
-    # 关键：检查单股 chart_df 是否包含今日最新分时/收盘数据，若缺失则实时拉取并补全追加
+    # 关键：检查单股 chart_df 是否包含今日最新分时/收盘数据 (仅在开市交易时间 09:25 之后才拉取，非交易时间直接复用时序，避免产生海量无意义网络轮询)
     today_dash = today_date.strftime("%Y-%m-%d")
     latest_date = str(chart_df["交易日期"].iloc[-1]).split()[0] if "交易日期" in chart_df.columns and not chart_df.empty else ""
-    if latest_date < today_dash:
+    now_time = datetime.datetime.now().time()
+    can_have_today_bar = (now_time >= datetime.time(9, 25)) and (today_date.weekday() < 5)
+    if latest_date < today_dash and can_have_today_bar:
         today_bar_map = fetch_batch_realtime_bars([code_clean])
         single_bar = today_bar_map.get(code_clean)
         if single_bar and single_bar.get("收盘价", 0) > 0:
             single_bar_copy = dict(single_bar)
-            single_bar_copy["交易日期"] = today_dash
+            single_bar_copy["交易日期"] = single_bar.get("交易日期") or today_dash
             chart_df = pd.concat([chart_df, pd.DataFrame([single_bar_copy])], ignore_index=True)
             chart_df.drop_duplicates(subset=["交易日期"], keep="last", inplace=True)
 
@@ -468,13 +481,14 @@ def render_stock_kline_chart(df: pd.DataFrame, code: str, name: str = "", output
         return ""
 
 
-def render_all_stock_kline_charts(df: pd.DataFrame, chart_dir: str = None, max_workers: int = 30) -> list[str]:
+def render_all_stock_kline_charts(df: pd.DataFrame, chart_dir: str = None, max_workers: int = 30, force_refresh: bool = False) -> list[str]:
     """并发生成 DataFrame 中包含的所有个股日K线走势图表（存在已生成的直接秒级复用）。
 
     参数:
         df: 包含全量或板块个股K线数据的 DataFrame
         chart_dir: 图表输出目录（默认 kline_charts/）
         max_workers: 并发工作线程数，默认 30
+        force_refresh: 是否强制重绘所有图表，默认 False
     返回:
         所有已就绪的个股 K 线走势图 PNG 绝对路径列表
     """
@@ -482,7 +496,7 @@ def render_all_stock_kline_charts(df: pd.DataFrame, chart_dir: str = None, max_w
         return []
 
     # 关键：在绘制全量个股走势图前，一次性并发补全今日最新行情分时数据并重新计算全量均线，使多线程绘图 100% 内存直接提取，零网络延时
-    df = append_today_realtime_data_if_missing(df)
+    df = append_today_realtime_data_if_missing(df, force_refresh=force_refresh)
 
     root_dir = get_project_root()
     target_dir = chart_dir or os.path.join(root_dir, "kline_charts")
@@ -514,14 +528,17 @@ def render_all_stock_kline_charts(df: pd.DataFrame, chart_dir: str = None, max_w
         c_code_clean = str(c_code).zfill(6)
         c_name = str(sdf["股票简称"].iloc[-1]) if "股票简称" in sdf.columns and not sdf.empty else c_code_clean
 
-        # 极速判断：当节点运行日期 > 生成日期时，视为已经下载了最新的个股K线图，就无需再下载重绘，微秒级直接复用
-        if c_code_clean in existing_chart_map:
+        latest_bar_date = str(sdf["交易日期"].iloc[-1]).split()[0] if "交易日期" in sdf.columns and not sdf.empty else ""
+        latest_bar_d = datetime.datetime.strptime(latest_bar_date, "%Y-%m-%d").date() if latest_bar_date else today_date
+
+        # 极速判断：只有当已有图表的生成日期 >= 数据最新日期且 >= 今日日期时，才直接微秒级复用
+        if c_code_clean in existing_chart_map and not force_refresh:
             exist_path, exist_date = existing_chart_map[c_code_clean]
-            if today_date > exist_date:
+            if exist_date >= latest_bar_d and exist_date >= today_date:
                 return exist_path
 
-        # 当节点运行日期 <= 生成日期（或未生成过）：重新生成替换对应个股K线图
-        return render_stock_kline_chart(sdf, c_code_clean, c_name, output_dir=target_dir)
+        # 当已有图表早于最新数据/今日（历史旧图），或尚未生成过：重新生成替换对应个股K线图（绘制今日最新K线柱）
+        return render_stock_kline_chart(sdf, c_code_clean, c_name, output_dir=target_dir, force_refresh=force_refresh)
 
     all_charts = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -535,6 +552,218 @@ def render_all_stock_kline_charts(df: pd.DataFrame, chart_dir: str = None, max_w
     return all_charts
 
 
+def get_previous_trading_day_str(df: pd.DataFrame = None) -> str:
+    """计算基准前一交易日日期 (YYYY-MM-DD)。
+    优先根据日K线全局数据集中的交易日期判定；若不可用则根据工作日向前回溯（周一前一天为周五）。
+    """
+    today = datetime.date.today()
+    today_str = today.strftime("%Y-%m-%d")
+
+    if df is not None and not df.empty and "交易日期" in df.columns:
+        valid_dates = sorted([str(d).split()[0] for d in df["交易日期"].dropna().unique()])
+        valid_dates = [d for d in valid_dates if d <= today_str]
+        if valid_dates:
+            # 若今日已开盘/有数据，则前一交易日为倒数第二条
+            if valid_dates[-1] == today_str and len(valid_dates) >= 2:
+                return valid_dates[-2]
+            elif valid_dates[-1] < today_str:
+                return valid_dates[-1]
+            elif len(valid_dates) >= 2:
+                return valid_dates[-2]
+
+    # 回退到工作日推算（周一前一天为上周五）
+    prev_d = today - datetime.timedelta(days=1)
+    while prev_d.weekday() >= 5:
+        prev_d -= datetime.timedelta(days=1)
+    return prev_d.strftime("%Y-%m-%d")
+
+
+def verify_and_patch_previous_day_kline(kline_charts: list[str], topic: str = "", max_workers: int = 15) -> list[str]:
+    """
+    校验个股K线图及基础数据是否有前一天的K线柱，若没有就自动拉取补齐并重新渲染生成K线图。
+
+    参数:
+        kline_charts: 当前 Node 1 搜集到的个股K线图文件路径列表
+        topic: 股票主题/代码，若为单股则聚焦单股校验
+        max_workers: 并发工作线程数，默认 15
+    返回:
+        更新并补齐后的全部个股K线图路径列表
+    """
+    if not kline_charts:
+        return []
+
+    root_dir = get_project_root()
+    stock_data_dir = os.path.join(root_dir, "stock_data")
+    summary_filename = f"{topic}_kline_all.csv" if (topic and topic != "全市场" and not re.match(r"^\d{6}$", topic)) else "stock_kline_all.csv"
+    summary_filepath = os.path.join(stock_data_dir, summary_filename)
+    if not os.path.exists(summary_filepath):
+        fallback_path = os.path.join(stock_data_dir, "stock_kline_all.csv")
+        if os.path.exists(fallback_path):
+            summary_filepath = fallback_path
+
+    combined_df = None
+    if os.path.exists(summary_filepath) and os.path.getsize(summary_filepath) > 10240:
+        try:
+            combined_df = pd.read_csv(summary_filepath, dtype={"股票代码": str, "code": str}, encoding="utf-8-sig")
+            if "股票代码" not in combined_df.columns and "code" in combined_df.columns:
+                combined_df["股票代码"] = combined_df["code"]
+            combined_df["股票代码"] = combined_df["股票代码"].astype(str).str.zfill(6)
+        except Exception:
+            combined_df = None
+
+    # 计算目标前一交易日
+    prev_day_str = get_previous_trading_day_str(combined_df)
+    today_str = datetime.date.today().strftime("%Y-%m-%d")
+    print(f"\n🔍 [前一日K线柱校验] 正在校验各标的是否包含前一交易日「{prev_day_str}」的K线柱 (当前基准日: {today_str})...")
+
+    kline_dir = os.path.join(root_dir, "kline_data")
+    chart_dir = os.path.join(root_dir, "kline_charts")
+
+    # 建立股票代码 -> 现有图表路径的映射
+    chart_map = {}
+    chart_code_to_name = {}
+    for p in kline_charts:
+        m = re.match(r"^(\d{6})_(.*?)_", os.path.basename(p))
+        if m:
+            c = m.group(1)
+            nm = m.group(2)
+            chart_map[c] = p
+            chart_code_to_name[c] = nm
+        else:
+            m2 = re.match(r"^(\d{6})_", os.path.basename(p))
+            if m2:
+                chart_map[m2.group(1)] = p
+
+    # 统计数据中已包含前一日K线柱的股票代码
+    existing_prev_day_codes = set()
+    if combined_df is not None and not combined_df.empty and "交易日期" in combined_df.columns:
+        prev_rows = combined_df[combined_df["交易日期"] == prev_day_str]
+        existing_prev_day_codes = set(prev_rows["股票代码"].dropna().astype(str).str.zfill(6))
+
+    # 找出缺失前一日K线柱或图表过期的股票
+    missing_codes = []
+    prev_day_nodash = prev_day_str.replace("-", "")
+    for c, chart_path in chart_map.items():
+        # 1. 汇总表中是否包含前一日
+        if c not in existing_prev_day_codes:
+            missing_codes.append(c)
+            continue
+        # 2. 检查图表文件名中的生成日期是否早于前一日
+        m_date = re.search(r"_(\d{8})_kline\.png$", os.path.basename(chart_path))
+        if m_date and m_date.group(1) < prev_day_nodash:
+            missing_codes.append(c)
+            continue
+        # 3. 检查单股独立 CSV 是否实际包含前一日
+        nm = chart_code_to_name.get(c, "")
+        local_csv = os.path.join(kline_dir, f"{c}_{nm}_kline.csv") if nm else None
+        if local_csv and os.path.exists(local_csv):
+            try:
+                stock_tail = pd.read_csv(local_csv, dtype={"股票代码": str}, encoding="utf-8-sig")
+                if "交易日期" in stock_tail.columns and prev_day_str not in stock_tail["交易日期"].values:
+                    missing_codes.append(c)
+            except Exception:
+                pass
+
+    if not missing_codes:
+        print(f"✨ [前一日K线柱校验通过] 全部 {len(chart_map)} 只标的均已包含前一交易日({prev_day_str})K线柱，无需补齐！")
+        return kline_charts
+
+    print(f"⚠️ [前一日K线柱校验] 发现 {len(missing_codes)} 只标的缺失前一交易日({prev_day_str})K线柱，正在自动并发拉取补齐并重绘走势图...")
+
+    patched_new_rows = []
+    patched_charts_map = {}
+
+    def _patch_single(code_clean):
+        stock_name = chart_code_to_name.get(code_clean, "")
+        try:
+            # 1. 尝试从单股独立 CSV 加载
+            local_csv = os.path.join(kline_dir, f"{code_clean}_{stock_name}_kline.csv") if stock_name else None
+            stock_df = None
+            if local_csv and os.path.exists(local_csv):
+                try:
+                    stock_df = pd.read_csv(local_csv, dtype={"股票代码": str}, encoding="utf-8-sig")
+                except Exception:
+                    stock_df = None
+
+            # 若本地未找到或仍缺失前一日，则通过新浪/腾讯行情接口拉取完整权威日K线数据
+            if stock_df is None or stock_df.empty or prev_day_str not in stock_df["交易日期"].values:
+                fetched_df = _fetch_single_stock_kline(code_clean, stock_name, limit=60)
+                if not fetched_df.empty:
+                    if stock_df is not None and not stock_df.empty:
+                        stock_df = pd.concat([stock_df, fetched_df], ignore_index=True)
+                    else:
+                        stock_df = fetched_df
+
+            if stock_df is None or stock_df.empty:
+                return None, None
+
+            # 2. 去重、排序并补充今日最新分时行情
+            stock_df["股票代码"] = stock_df["股票代码"].astype(str).str.zfill(6)
+            stock_df.drop_duplicates(subset=["股票代码", "交易日期"], keep="last", inplace=True)
+            stock_df.sort_values(by="交易日期", inplace=True)
+            stock_df = append_today_realtime_data_if_missing(stock_df)
+            stock_df = _ensure_kline_ma_columns(stock_df)
+
+            # 3. 写回单股独立 CSV
+            real_name = stock_name or (stock_df["股票简称"].iloc[-1] if "股票简称" in stock_df.columns and not stock_df.empty else code_clean)
+            indiv_path = os.path.join(kline_dir, f"{code_clean}_{real_name}_kline.csv")
+            stock_df.to_csv(indiv_path, index=False, encoding="utf-8-sig")
+
+            # 4. 强制重新渲染生成包含前一日K线柱的最新图表
+            new_chart_path = render_stock_kline_chart(stock_df, code_clean, real_name, output_dir=chart_dir, force_refresh=True)
+
+            # 返回提取出的前一日及最新补齐数据
+            missing_bar = stock_df[stock_df["交易日期"] == prev_day_str]
+            return (new_chart_path, missing_bar if not missing_bar.empty else None)
+        except Exception as e:
+            print(f"⚠️ 标的 {code_clean} 补齐前一日K线柱失败: {e}")
+            return None, None
+
+    max_workers_actual = min(max_workers, max(1, len(missing_codes)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers_actual) as executor:
+        future_to_code = {executor.submit(_patch_single, c): c for c in missing_codes}
+        for future in concurrent.futures.as_completed(future_to_code):
+            c_code = future_to_code[future]
+            try:
+                new_chart_path, missing_bar_df = future.result()
+                if new_chart_path and os.path.exists(new_chart_path):
+                    patched_charts_map[c_code] = new_chart_path
+                if missing_bar_df is not None and not missing_bar_df.empty:
+                    patched_new_rows.append(missing_bar_df)
+            except Exception:
+                pass
+
+    # 将补齐的条目写回全量汇总表
+    if patched_new_rows and combined_df is not None:
+        try:
+            patched_df = pd.concat(patched_new_rows, ignore_index=True)
+            combined_df = pd.concat([combined_df, patched_df], ignore_index=True)
+            combined_df.drop_duplicates(subset=["股票代码", "交易日期"], keep="last", inplace=True)
+            combined_df.sort_values(by=["股票代码", "交易日期"], inplace=True)
+            combined_df = _ensure_kline_ma_columns(combined_df)
+            combined_df.to_csv(summary_filepath, index=False, encoding="utf-8-sig")
+            print(f"💾 [汇总表同步] 已将补齐的 {len(patched_new_rows)} 条前一日K线数据持久化回写至 {os.path.basename(summary_filepath)}")
+        except Exception as e:
+            print(f"⚠️ 回写汇总表异常: {e}")
+
+    # 更新 kline_charts 列表中的路径
+    updated_charts = []
+    for p in kline_charts:
+        m = re.match(r"^(\d{6})_", os.path.basename(p))
+        c = m.group(1) if m else ""
+        if c in patched_charts_map:
+            updated_charts.append(patched_charts_map[c])
+        elif os.path.exists(p):
+            updated_charts.append(p)
+
+    for c, p in patched_charts_map.items():
+        if p not in updated_charts and os.path.exists(p):
+            updated_charts.append(p)
+
+    print(f"✅ [前一日K线柱补齐完成] 成功为 {len(patched_charts_map)} 只标的补充加入前一日({prev_day_str})K线柱，并重新生成了走势图表！\n")
+    return updated_charts
+
+
 def _fetch_single_stock_kline(code: str, name: str = "", limit: int = 60) -> pd.DataFrame:
     """获取单只股票的日K线图时序数据（包含五日线、十日线、二十日线、三十日线）。
     
@@ -542,7 +771,7 @@ def _fetch_single_stock_kline(code: str, name: str = "", limit: int = 60) -> pd.
     若异常或数据为空则自动回退到同花顺行情接口并增量计算均线。
     """
     code_clean = str(code).strip().zfill(6)
-    prefix = "sh" if code_clean.startswith(("6", "9")) else "sz"
+    prefix = "bj" if code_clean.startswith(("4", "8", "920")) else ("sh" if code_clean.startswith(("6", "9")) else "sz")
     full_sym = f"{prefix}{code_clean}"
     session = _get_kline_session()
 
@@ -564,7 +793,13 @@ def _fetch_single_stock_kline(code: str, name: str = "", limit: int = 60) -> pd.
             if isinstance(bars, list) and len(bars) > 0:
                 records = []
                 prev_close = None
-                stock_name = name or code_clean
+                stock_name = name
+                if not stock_name or stock_name == code_clean:
+                    try:
+                        resolved = _resolve_single_stock_name(code_clean)
+                        stock_name = resolved.get("name", code_clean)
+                    except Exception:
+                        stock_name = code_clean
                 for b in bars:
                     date_str = str(b.get("day", "")).split()[0]
                     open_p = float(b.get("open", 0.0))
@@ -1029,7 +1264,7 @@ def download_stock_day(topic: str = "", limit: int = 60) -> str:
                 combined_df["股票代码"] = combined_df["股票代码"].astype(str).str.zfill(6)
 
                 # 全自动补全今日最新行情分时数据并更新均线系统，写回本地汇总 CSV
-                combined_df = append_today_realtime_data_if_missing(combined_df)
+                combined_df = append_today_realtime_data_if_missing(combined_df, force_refresh=True)
                 combined_df = _ensure_kline_ma_columns(combined_df)
                 combined_df.to_csv(summary_filepath, index=False, encoding="utf-8-sig")
 
@@ -1159,7 +1394,7 @@ def download_stock_day(topic: str = "", limit: int = 60) -> str:
     # 4. 合并生成总K线汇总 CSV 保存到 stock_data 目录（存在相同文件则直接覆盖）
     print("💾 正在整合生成包含均线指标的全量日K线汇总 CSV...")
     combined_df = pd.concat(all_kline_dfs, ignore_index=True)
-    combined_df = append_today_realtime_data_if_missing(combined_df)
+    combined_df = append_today_realtime_data_if_missing(combined_df, force_refresh=True)
     combined_df = _ensure_kline_ma_columns(combined_df)
     summary_filename = f"{topic_clean}_kline_all.csv" if topic_clean else "stock_kline_all.csv"
     summary_filepath = os.path.join(stock_data_dir, summary_filename)
