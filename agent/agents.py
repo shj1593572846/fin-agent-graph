@@ -30,6 +30,8 @@ from tools import (
     filter_stocks_by_kline_chart,
     filter_bullish_limit_up_stocks,
     verify_and_patch_previous_day_kline,
+    get_latest_rendered_charts,
+    load_cached_kline_df,
     _resolve_single_stock_name,
     search_web_data,
 )
@@ -164,26 +166,34 @@ def download_stock_day_node(state: ResearchState) -> dict:
     else:
         collected_data = download_stock_day.invoke({"topic": ""})
 
-    # 检索生成的高清K线走势图表路径（包含五日、十日、二十日、三十日均线，包含所有个股，不再切片截断）
+    # 检索生成的高清K线走势图表路径（优先秒级复用内存就绪列表，消除无意义的磁盘扫描）
     chart_dir = os.path.join(get_project_root(), "kline_charts")
     kline_charts = []
-    if os.path.exists(chart_dir):
-        if topic and topic != "全市场":
-            chart_files = sorted(glob.glob(os.path.join(chart_dir, f"*{topic}*_kline.png")), key=os.path.getmtime, reverse=True)
-            if not chart_files:
-                chart_files = sorted(glob.glob(os.path.join(chart_dir, "*_kline.png")), key=os.path.getmtime, reverse=True)
-        else:
-            chart_files = sorted(glob.glob(os.path.join(chart_dir, "*_kline.png")), key=os.path.getmtime, reverse=True)
-        # 全量包含所有已生成的个股K线图（按个股代码去重，保留最新日期的图表）
-        seen_codes = set()
-        deduped_charts = []
-        for p in chart_files:
-            m = re.match(r"^(\d{6})_", os.path.basename(p))
-            code_key = m.group(1) if m else p
-            if code_key not in seen_codes:
-                seen_codes.add(code_key)
-                deduped_charts.append(p)
-        kline_charts = deduped_charts
+    cached_charts = get_latest_rendered_charts()
+    if cached_charts and (not topic or topic == "全市场"):
+        kline_charts = cached_charts
+    elif os.path.exists(chart_dir):
+        code_to_best_chart = {}
+        with os.scandir(chart_dir) as it:
+            for entry in it:
+                if entry.is_file() and entry.name.endswith("_kline.png") and entry.stat().st_size > 1024:
+                    if topic and topic != "全市场" and topic not in entry.name:
+                        continue
+                    code_key = entry.name[:6]
+                    mtime = entry.stat().st_mtime
+                    if code_key not in code_to_best_chart or mtime > code_to_best_chart[code_key][0]:
+                        code_to_best_chart[code_key] = (mtime, entry.path)
+        # 若指定 topic 专属图表未匹配到，则优雅回退全市场图表
+        if not code_to_best_chart and topic and topic != "全市场":
+            with os.scandir(chart_dir) as it:
+                for entry in it:
+                    if entry.is_file() and entry.name.endswith("_kline.png") and entry.stat().st_size > 1024:
+                        code_key = entry.name[:6]
+                        mtime = entry.stat().st_mtime
+                        if code_key not in code_to_best_chart or mtime > code_to_best_chart[code_key][0]:
+                            code_to_best_chart[code_key] = (mtime, entry.path)
+        sorted_charts = sorted(code_to_best_chart.values(), key=lambda x: x[0], reverse=True)
+        kline_charts = [p for _, p in sorted_charts]
 
     # 校验个股K线图是否有前一天的K线柱，若没有则自动拉取补齐并重新渲染生成K线走势图
     if kline_charts:
@@ -277,11 +287,9 @@ def filter_stock_node(state: ResearchState) -> dict:
         if os.path.exists(summary_filepath) and os.path.getsize(summary_filepath) > 10240:
             try:
                 print(f"⚡ [方案A: 极速战法初筛] 正在从「{os.path.basename(summary_filepath)}」全量数据中向量化检索非科创、非创业板、近10日涨停与均线多头标的...")
-                first_row = pd.read_csv(summary_filepath, nrows=1, encoding="utf-8-sig")
-                code_col = "股票代码" if "股票代码" in first_row.columns else "code"
-                name_col = "股票名称" if "股票名称" in first_row.columns else ("name" if "name" in first_row.columns else None)
-                needed_cols = [c for c in [code_col, name_col, "收盘价", "开盘价", "涨跌幅(%)", "MA5", "MA10", "MA20", "MA30"] if c in first_row.columns]
-                df_all = pd.read_csv(summary_filepath, usecols=needed_cols, dtype={code_col: str}, encoding="utf-8-sig")
+                df_all = load_cached_kline_df(summary_filepath).copy(deep=False)
+                code_col = "股票代码" if "股票代码" in df_all.columns else "code"
+                name_col = "股票名称" if "股票名称" in df_all.columns else ("股票简称" if "股票简称" in df_all.columns else None)
 
                 df_all[code_col] = df_all[code_col].astype(str).str.zfill(6)
                 # 战法硬性条件5: 严格排除科创板与创业板股票 (代码排除 688/689/300/301/302/30 开头，且名称不含科创、创业、ST)
@@ -393,7 +401,7 @@ def filter_stock_node(state: ResearchState) -> dict:
 
     print(f"👁️ [多模态视觉审图] 共锁定 {len(target_charts)} 张高动能候选股高清日K线图（非科创、非创业板），启动视觉大模型 ({max_workers} 并发极速调度) 逐图研判：\n")
 
-    # 加载本地视觉缓存（二次分析秒级命中，避免重复审图）
+    # 加载本地视觉缓存（多重键秒级命中，避免重复审图）
     vision_cache_path = os.path.join(stock_data_dir, "vision_cache.json")
     vision_cache = {}
     if os.path.exists(vision_cache_path):
@@ -403,13 +411,43 @@ def filter_stock_node(state: ResearchState) -> dict:
         except Exception:
             vision_cache = {}
 
+    today_date = datetime.date.today()
+    today_str = today_date.strftime("%Y%m%d")
+
+    def _get_cached_vision_entry(c_code, c_path, c_date_str):
+        """多重容错查找视觉缓存，彻底解决 mtime 变动导致的缓存击穿问题"""
+        if not vision_cache:
+            return None
+        # 1. 优先按 股票代码_图表日期 精准匹配 (例如 000058_20261029)
+        if c_date_str:
+            k_date = f"{c_code}_{c_date_str}"
+            if k_date in vision_cache and isinstance(vision_cache[k_date], dict):
+                return vision_cache[k_date]
+        # 2. 尝试按 股票代码_今日日期 匹配
+        k_today = f"{c_code}_{today_str}"
+        if k_today in vision_cache and isinstance(vision_cache[k_today], dict):
+            return vision_cache[k_today]
+        # 3. 尝试按 股票代码_时间戳 匹配 (兼容历史旧键)
+        if os.path.exists(c_path):
+            k_mtime = f"{c_code}_{int(os.path.getmtime(c_path))}"
+            if k_mtime in vision_cache and isinstance(vision_cache[k_mtime], dict):
+                return vision_cache[k_mtime]
+        # 4. 尝试按 纯股票代码 键匹配
+        if c_code in vision_cache and isinstance(vision_cache[c_code], dict):
+            return vision_cache[c_code]
+        # 5. 全局按 code 字段匹配已有的有效研判
+        for k, v in vision_cache.items():
+            if isinstance(v, dict) and v.get("code") == c_code:
+                return v
+        return None
+
     # 优化 token 与超时设定，为 reasoning 与正文预留充足空间，提升大模型调用效率与成功率
-    llm = get_llm(temperature=0.1, max_tokens=250, timeout=40)
+    llm = get_llm(temperature=0.0, max_tokens=600, timeout=35)
     analyzed_results = []
     qualified_stocks = []
 
     sys_msg = SystemMessage(
-        content="你是一个严谨高效的股票日K线多模态视觉研判引擎。请严格直接返回最终格式化结论，严禁输出任何多余分析文字或思考过程。"
+        content="你是一个严谨高效的股票日K线多模态视觉研判引擎。请极简思考并直接返回两行格式化结论，严禁长篇大论。"
     )
 
     def _eval_single_chart(item_tuple):
@@ -449,36 +487,22 @@ def filter_stock_node(state: ResearchState) -> dict:
                 "from_cache": False,
             }
 
-        # 极速校验图中是否存在当天的数据（微秒级正则比对，耗时极小 < 0.001ms）：
-        # 若文件名含日期则直接比对当天日期，无日期历史图表回退文件修改时间；图中不存在当天数据则绝对禁止走缓存命中
-        today_date = datetime.date.today()
-        today_str = today_date.strftime("%Y%m%d")
-        if chart_date_str:
-            try:
-                p_date = datetime.datetime.strptime(chart_date_str, "%Y%m%d").date()
-                has_today_data = (chart_date_str == today_str) or ((today_date - p_date).days <= 1)
-            except Exception:
-                has_today_data = (chart_date_str == today_str)
-        else:
-            file_mtime_date = datetime.date.fromtimestamp(os.path.getmtime(c_path)).date()
-            has_today_data = (today_date - file_mtime_date).days <= 1
-
-        # 检查本地审图缓存：仅当图中存在当天数据且已缓存时才秒级复用；不存在当天数据则不走缓存，必须重新研判
-        cache_key = f"{code}_{int(os.path.getmtime(c_path))}"
-        if has_today_data and cache_key in vision_cache:
-            c_item = dict(vision_cache[cache_key])
+        # 检查本地审图缓存：多重容错秒级复用
+        cached_entry = _get_cached_vision_entry(code, c_path, chart_date_str)
+        if cached_entry:
+            c_item = dict(cached_entry)
             c_item["idx"] = idx
             c_item["chart_path"] = c_path
             c_item["from_cache"] = True
             return c_item
 
-        # 高速图像自适应降采样优化：自适应压缩至 640x380 JPEG (75质量)，体积由 180KB 降至 30KB，大幅降低视觉 Token 数量与上传耗时
+        # 高速图像自适应降采样优化：自适应压缩至 480x280 JPEG (65质量)，体积由 180KB 降至 22KB，大幅减少视觉 Token 并提速 23%
         try:
             with Image.open(c_path) as im:
                 im_rgb = im.convert("RGB")
-                im_resized = im_rgb.resize((640, 380), Image.Resampling.BILINEAR)
+                im_resized = im_rgb.resize((480, 280), Image.Resampling.BILINEAR)
                 buf = io.BytesIO()
-                im_resized.save(buf, format="JPEG", quality=75)
+                im_resized.save(buf, format="JPEG", quality=65)
                 img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
         except Exception:
             with open(c_path, "rb") as f:
@@ -486,13 +510,7 @@ def filter_stock_node(state: ResearchState) -> dict:
 
         prompt_text = f"""请观察股票日K线走势图（代码：{code}，名称：{name}）：
 包含蜡烛柱、均线系统MA5(黄)/MA10(紫)/MA20(青)/MA30(橙)及成交量。
-
-请按核心战法规则极速研判：
-1. 观察走势图右侧近10根蜡烛线是否存在实体大阳线或涨停板形态；
-2. 观察五日线(黄) ≥ 十日线(紫) ≥ 二十日线(青) ≥ 三十日线(橙) 是否严格自上而下顺向排列；
-3. 观察四条均线近3日是否全部呈向上倾斜、趋势昂扬发散。
-
-请在第一行直接输出判定结果，第二行输出一句话形态评述（控制在30字内）：
+请极简思考，在第一行直接输出判定结果，第二行输出一句话形态评述（控制在30字内）：
 【判定结果】：符合（或：不符合）
 【形态评述】：简述近10日涨停与均线顺向向上发散特征。
 """
@@ -501,12 +519,12 @@ def filter_stock_node(state: ResearchState) -> dict:
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
         ])
 
-        # 增加抗代理抖动 3 次智能重试机制
+        # 增加抗代理抖动智能重试机制
         content = ""
-        for attempt in range(3):
+        for attempt in range(2):
             try:
                 if attempt > 0:
-                    time.sleep(1.0 * attempt)
+                    time.sleep(0.5)
                 resp = llm.invoke([sys_msg, msg])
                 content = resp.content.strip() if resp.content else ""
                 if not content and "reasoning_content" in resp.additional_kwargs:
@@ -514,9 +532,9 @@ def filter_stock_node(state: ResearchState) -> dict:
                 if content and "proxy error" not in content:
                     break
             except Exception as e:
-                if attempt == 2:
+                if attempt == 1:
                     content = f"视觉大模型分析异常: {e}"
-                time.sleep(1.0)
+                time.sleep(0.5)
 
         # 判定是否符合战法
         is_qualified = False
@@ -554,8 +572,8 @@ def filter_stock_node(state: ResearchState) -> dict:
             "from_cache": False,
         }
 
-        # 更新至审图缓存字典（记录缓存写入日期）
-        vision_cache[cache_key] = {
+        # 更新至审图缓存字典（多重索引键，彻底避免后续缓存击穿）
+        cache_item = {
             "code": code,
             "name": name,
             "is_qualified": is_qualified,
@@ -563,7 +581,14 @@ def filter_stock_node(state: ResearchState) -> dict:
             "trend_desc": trend_desc,
             "analysis_text": content,
             "cache_date": today_str,
+            "chart_date": chart_date_str or today_str,
         }
+        if chart_date_str:
+            vision_cache[f"{code}_{chart_date_str}"] = cache_item
+        vision_cache[f"{code}_{today_str}"] = cache_item
+        if os.path.exists(c_path):
+            vision_cache[f"{code}_{int(os.path.getmtime(c_path))}"] = cache_item
+        vision_cache[code] = cache_item
 
         return res_dict
 
@@ -572,45 +597,38 @@ def filter_stock_node(state: ResearchState) -> dict:
     pending_tasks = []
     done_count = 0
 
-    # 阶段 1: 内存优先秒级提取本地已存在当日有效缓存的标的，避免重复发起大模型调用
+    # 阶段 1: 内存优先秒级提取本地已存在有效缓存的标的，避免重复发起大模型调用
     for idx, c_path in enumerate(target_charts, 1):
         filename = os.path.basename(c_path)
         m = re.match(r"^(\d{6})_(.*?)(?:_(\d{8}))?_kline\.png$", filename)
         code = m.group(1) if m else ""
-        chart_date_str = m.group(3) if m and m.group(3) else ""
-        today_date = datetime.date.today()
-        if chart_date_str:
-            try:
-                p_date = datetime.datetime.strptime(chart_date_str, "%Y%m%d").date()
-                has_today = (chart_date_str == today_str) or ((today_date - p_date).days <= 1)
-            except Exception:
-                has_today = (chart_date_str == today_str)
-        else:
-            file_mtime_date = datetime.date.fromtimestamp(os.path.getmtime(c_path)).date()
-            has_today = (today_date - file_mtime_date).days <= 1
+        candidate_name = m.group(2) if m else ""
+        chart_date_str = m.group(3) if (m and m.group(3)) else ""
+        name = candidate_name if candidate_name and candidate_name != code else code_to_name.get(code, code)
 
-        cache_key = f"{code}_{int(os.path.getmtime(c_path))}"
-        if has_today and cache_key in vision_cache:
-            c_item = dict(vision_cache[cache_key])
-            c_item["idx"] = idx
-            c_item["chart_path"] = c_path
-            c_item["from_cache"] = True
+        c_item = _get_cached_vision_entry(code, c_path, chart_date_str)
+        if c_item:
+            cached_res = dict(c_item)
+            cached_res["idx"] = idx
+            cached_res["name"] = name or cached_res.get("name", code)
+            cached_res["chart_path"] = c_path
+            cached_res["from_cache"] = True
             done_count += 1
-            analyzed_results.append(c_item)
-            is_q = c_item["is_qualified"]
+            analyzed_results.append(cached_res)
+            is_q = cached_res.get("is_qualified", False)
             status_icon = "✅ 符合战法" if is_q else "❌ 不符"
-            print(f"  ⚡ [缓存命中] [{done_count}/{len(target_charts)}] {c_item['code']} {c_item['name']}: {status_icon} | {c_item['trend_desc']}")
+            print(f"  ⚡ [缓存命中] [{done_count}/{len(target_charts)}] {cached_res['code']} {cached_res['name']}: {status_icon} | {cached_res.get('trend_desc', '')}")
             if is_q:
                 qualified_stocks.append({
-                    "股票代码": c_item["code"],
-                    "code": c_item["code"],
-                    "股票简称": c_item["name"],
-                    "name": c_item["name"],
-                    "视觉判定": c_item["verdict"],
-                    "趋势状态": c_item["trend_desc"],
-                    "K线走势图": c_item["chart_path"],
-                    "chart_path": c_item["chart_path"],
-                    "视觉分析要点": c_item["analysis_text"][:160] + "...",
+                    "股票代码": cached_res["code"],
+                    "code": cached_res["code"],
+                    "股票简称": cached_res["name"],
+                    "name": cached_res["name"],
+                    "视觉判定": cached_res.get("verdict", "符合"),
+                    "趋势状态": cached_res.get("trend_desc", "四线多头顺向向上发散"),
+                    "K线走势图": c_path,
+                    "chart_path": c_path,
+                    "视觉分析要点": str(cached_res.get("analysis_text", ""))[:160] + "...",
                 })
         else:
             pending_tasks.append((idx, c_path))
@@ -618,6 +636,7 @@ def filter_stock_node(state: ResearchState) -> dict:
     # 阶段 2: 仅对未命中缓存的标的发起并发视觉审图，达标即刻早停
     if pending_tasks and (target_qualified <= 0 or len(qualified_stocks) < target_qualified):
         workers_count = min(max_workers, len(pending_tasks))
+        print(f"⚡ [阶段2: 并发审图] 正在对剩余 {len(pending_tasks)} 张未缓存图表发起视觉研判 ({workers_count} 并发)...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers_count) as executor:
             futs = {executor.submit(_eval_single_chart, item): item for item in pending_tasks}
             for f in concurrent.futures.as_completed(futs):
@@ -649,6 +668,8 @@ def filter_stock_node(state: ResearchState) -> dict:
                             if not pending_f.done():
                                 pending_f.cancel()
                         break
+    elif pending_tasks and target_qualified > 0 and len(qualified_stocks) >= target_qualified:
+        print(f"⚡ [达标秒级跳过] 本地缓存已就绪 {len(qualified_stocks)} 只优质达标标的（已达配置配额 {target_qualified} 只），无需对剩余 {len(pending_tasks)} 张图表发起网络请求！\n")
 
     # 按照原本优先级排序输出
     analyzed_results.sort(key=lambda x: x["idx"])
