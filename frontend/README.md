@@ -26,4 +26,4 @@ npm run dev
 > 前端开发服务器启动于 `http://localhost:5173/`。
 
 ### 3. 一键启动脚本
-在根目录双击执行 `start.bat` 即可同时启动后端与前端。
+在项目根目录运行 [`run/windows/start.bat`](../run/windows/start.bat)（或 Linux 执行 `bash run/linux/start.sh`）即可同时启动后端与前端。

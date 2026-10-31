@@ -1,5 +1,8 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react'
 import RagKnowledgeView from './RagKnowledgeView'
+import AgentEvalView from './AgentEvalView'
+import LoginModal from './LoginModal'
+import { getToken, removeToken, getCurrentUser } from './auth'
 import './App.css'
 
 const PRESET_TOPICS = [
@@ -44,6 +47,11 @@ export default function App() {
   const [recommendations, setRecommendations] = useState([])
   const [showRecModal, setShowRecModal] = useState(false)
 
+  // 用户认证与登录弹窗状态
+  const [isAuthenticated, setIsAuthenticated] = useState(() => !!getToken())
+  const [currentUser, setCurrentUser] = useState(() => getCurrentUser())
+  const [showLoginModal, setShowLoginModal] = useState(() => !getToken())
+
   // 首页一级菜单导航: 'stock_selection' (量化选股) | 'task_management' (定时任务管理) | 'rag_knowledge' (研报财报知识库)
   const [activeMenu, setActiveMenu] = useState('stock_selection')
   const [ragDocCount, setRagDocCount] = useState(0)
@@ -73,11 +81,81 @@ export default function App() {
 
   // 通用后端 API 地址计算
   const getApiUrl = (endpoint) => {
-    if (window.location.port !== '8000') {
+    // 仅在本地 Vite 开发环境 (5173 / 3000 端口) 跨端口调试时直连 8000；生产环境 (如 8000 端口或 Nginx 反向代理) 直接复用相对路径
+    if (window.location.port === '5173' || window.location.port === '3000') {
       const hostname = window.location.hostname === 'localhost' ? '127.0.0.1' : (window.location.hostname || '127.0.0.1')
       return `http://${hostname}:8000${endpoint}`
     }
     return endpoint
+  }
+
+  // 监听全局 401 未授权或令牌过期事件
+  useEffect(() => {
+    const handleUnauthorized = () => {
+      setIsAuthenticated(false)
+      setCurrentUser(null)
+      setShowLoginModal(true)
+      showToast('⚠️ 登录已过期或未授权，请重新登录')
+    }
+    window.addEventListener('fin_auth_unauthorized', handleUnauthorized)
+    return () => window.removeEventListener('fin_auth_unauthorized', handleUnauthorized)
+  }, [])
+
+  // 页面加载时校验当前 Token 凭据有效性
+  useEffect(() => {
+    const checkAuth = async () => {
+      const token = getToken()
+      if (!token) {
+        setIsAuthenticated(false)
+        setShowLoginModal(true)
+        return
+      }
+      try {
+        const res = await fetch(getApiUrl('/api/auth/me'))
+        if (res.ok) {
+          const json = await res.json()
+          if (json.success && json.user) {
+            setIsAuthenticated(true)
+            setCurrentUser(json.user)
+            setShowLoginModal(false)
+          } else {
+            removeToken()
+            setIsAuthenticated(false)
+            setShowLoginModal(true)
+          }
+        } else if (res.status === 401) {
+          removeToken()
+          setIsAuthenticated(false)
+          setShowLoginModal(true)
+        }
+      } catch (e) {
+        // 离线环境暂不强制清空
+      }
+    }
+    checkAuth()
+  }, [])
+
+  // 登录成功回调
+  const handleLoginSuccess = (user) => {
+    setIsAuthenticated(true)
+    setCurrentUser(user)
+    setShowLoginModal(false)
+    showToast(`🎉 欢迎登录，${user.username || '管理员'}！`)
+    fetchRecommendations()
+    fetchTasks()
+    fetchRagDocCount()
+  }
+
+  // 安全退出登录
+  const handleLogout = async () => {
+    try {
+      await fetch(getApiUrl('/api/auth/logout'), { method: 'POST' })
+    } catch (e) {}
+    removeToken()
+    setIsAuthenticated(false)
+    setCurrentUser(null)
+    setShowLoginModal(true)
+    showToast('👋 已成功退出系统登录')
   }
 
   // 拉取 MySQL stock_recommendation 最新记录
@@ -489,12 +567,19 @@ export default function App() {
   const handleStart = () => {
     if (status === 'running') return
 
+    const token = getToken()
+    if (!token) {
+      showToast('❌ 请先登录系统后再执行选股任务')
+      setShowLoginModal(true)
+      return
+    }
+
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    // 如果在 Vite 开发服务器 (如 5173 端口)，优先直连后端端口 8000 保证稳定流式推送
-    let wsUrl = `${protocol}//${window.location.host}/ws/run`
-    if (window.location.port === '5173') {
+    // 如果在 Vite 开发服务器 (如 5173 / 3000 端口)，优先直连后端端口 8000；生产环境直接连接当前 host
+    let wsUrl = `${protocol}//${window.location.host}/ws/run?token=${encodeURIComponent(token)}`
+    if (window.location.port === '5173' || window.location.port === '3000') {
       const hostname = window.location.hostname === 'localhost' ? '127.0.0.1' : (window.location.hostname || '127.0.0.1')
-      wsUrl = `${protocol}//${hostname}:8000/ws/run`
+      wsUrl = `${protocol}//${hostname}:8000/ws/run?token=${encodeURIComponent(token)}`
     }
 
     // 初始化状态
@@ -760,9 +845,45 @@ export default function App() {
               {ragDocCount} 篇文档
             </span>
           </button>
+
+          <button
+            type="button"
+            className={`nav-menu-item ${activeMenu === 'agent_eval' ? 'active' : ''}`}
+            onClick={() => setActiveMenu('agent_eval')}
+          >
+            <span className="nav-icon">📊</span>
+            <span className="nav-label">选股评测中心</span>
+            <span className="task-count-chip eval-chip">
+              诊断打分
+            </span>
+          </button>
         </nav>
 
         <div className="header-status-group">
+          {currentUser && (
+            <div className="status-chip user-chip" style={{ display: 'flex', alignItems: 'center', gap: '8px', backgroundColor: 'rgba(56, 189, 248, 0.12)', border: '1px solid rgba(56, 189, 248, 0.3)' }}>
+              <span style={{ fontSize: '13px', color: '#38bdf8', fontWeight: 600 }}>👤 {currentUser.username || 'admin'}</span>
+              <button
+                type="button"
+                onClick={handleLogout}
+                title="退出登录"
+                style={{
+                  background: 'rgba(255, 255, 255, 0.1)',
+                  border: 'none',
+                  color: '#cbd5e1',
+                  cursor: 'pointer',
+                  fontSize: '11px',
+                  padding: '2px 8px',
+                  borderRadius: '4px',
+                  transition: 'all 0.2s',
+                }}
+                onMouseEnter={(e) => { e.target.style.backgroundColor = 'rgba(239, 68, 68, 0.25)'; e.target.style.color = '#f87171' }}
+                onMouseLeave={(e) => { e.target.style.backgroundColor = 'rgba(255, 255, 255, 0.1)'; e.target.style.color = '#cbd5e1' }}
+              >
+                退出
+              </button>
+            </div>
+          )}
           <div className={`status-chip ${serverOnline ? 'online' : 'offline'}`}>
             <span className="status-dot"></span>
             <span>{serverOnline ? 'FastAPI 后端已连接 (8000)' : '后端未就绪 (请运行 python server.py)'}</span>
@@ -1454,6 +1575,11 @@ export default function App() {
         />
       )}
 
+      {/* 📊 选股 Agent 评测中心与中间步骤诊断 主页面内容 */}
+      {activeMenu === 'agent_eval' && (
+        <AgentEvalView getApiUrl={getApiUrl} />
+      )}
+
       {/* 荐股记录弹窗 (stock_recommendation) */}
       {showRecModal && (
         <div className="rec-modal-overlay" onClick={() => setShowRecModal(false)}>
@@ -1813,6 +1939,12 @@ export default function App() {
           <span>{toast}</span>
         </div>
       )}
+
+      {/* 安全图形验证码登录弹窗 */}
+      <LoginModal
+        isOpen={showLoginModal}
+        onLoginSuccess={handleLoginSuccess}
+      />
     </div>
   )
 }

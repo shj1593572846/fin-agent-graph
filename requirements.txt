@@ -16,3 +16,6 @@ chromadb>=0.4.0
 pypdf>=3.0.0
 python-docx>=0.8.11
 python-multipart>=0.0.6
+matplotlib>=3.7.0
+Pillow>=9.5.0
+numpy>=1.23.0

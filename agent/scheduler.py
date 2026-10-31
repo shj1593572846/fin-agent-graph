@@ -32,6 +32,9 @@ except ImportError:
 _PROJECT_ROOT = os.path.dirname(_CURRENT_DIR)
 _JSON_FALLBACK_PATH = os.path.join(_PROJECT_ROOT, "stock_data", "cron_tasks.json")
 
+# 系统定时任务执行超时时间 (秒)：设置为 2 小时 (7200 秒)，支持通过环境变量 TASK_TIMEOUT_SECONDS 灵活调整
+TASK_TIMEOUT_SECONDS = int(os.getenv("TASK_TIMEOUT_SECONDS", "7200"))
+
 
 # ==============================================================================
 # Cron 表达式与时间计算
@@ -573,7 +576,7 @@ class TaskScheduler:
                     encoding="utf-8",
                     errors="replace",
                     env=env,
-                    timeout=1800,
+                    timeout=TASK_TIMEOUT_SECONDS,
                     **run_kwargs,
                 )
                 stdout_str = (proc.stdout or "").strip()
@@ -593,7 +596,7 @@ class TaskScheduler:
                     task["last_result"] = f"执行异常 (退出码 {proc.returncode}): {summary}"
             except subprocess.TimeoutExpired:
                 task["last_status"] = "error"
-                task["last_result"] = "执行超时 (超过 600 秒)"
+                task["last_result"] = f"执行超时 (超过 {TASK_TIMEOUT_SECONDS // 3600} 小时)"
             except Exception as ex:
                 task["last_status"] = "error"
                 task["last_result"] = f"启动异常: {str(ex)}"

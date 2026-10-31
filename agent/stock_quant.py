@@ -27,12 +27,14 @@ if _PROJECT_ROOT not in sys.path:
 
 # 优先定位当前脚本目录或项目根目录下的 .env
 for _dir in [_CURRENT_DIR, _PROJECT_ROOT]:
+    _env_prod = os.path.join(_dir, ".env.prod")
+    if os.path.exists(_env_prod):
+        load_dotenv(dotenv_path=_env_prod)
     _env_file = os.path.join(_dir, ".env")
     if os.path.exists(_env_file):
         load_dotenv(dotenv_path=_env_file)
-        break
-else:
-    load_dotenv()
+load_dotenv(".env.prod")
+load_dotenv(".env")
 
 # ==============================================================================
 # 1. 配置参数与大模型客户端

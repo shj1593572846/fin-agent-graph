@@ -9,12 +9,13 @@ import asyncio
 import subprocess
 import signal
 from typing import Optional, Any
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(".env.prod")
+load_dotenv(".env")
 
 # 确保在 Windows 环境下优先启用 ProactorEventLoop，支持异步管道通信与子进程创建
 if sys.platform == "win32":
@@ -38,6 +39,122 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
+from fastapi import Request
+from agent.auth import (
+    verify_token,
+    verify_captcha,
+    generate_svg_captcha,
+    authenticate_user,
+    create_token,
+)
+
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    """统一全局鉴权中间件：保护所有 /api/* 与 /rag/* 端点，未登录返回 401"""
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+
+        # 1. 跨域预检直接放行
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
+        # 2. 判断是否属于受保护的 API 或 RAG 路由
+        is_api_route = path.startswith("/api/") or path.startswith("/rag/")
+
+        # 3. 公开免鉴权白名单：图形验证码、登录接口、系统健康检测探针
+        is_public_api = (
+            path in ["/api/auth/captcha", "/api/auth/login", "/api/health"]
+            or path.startswith("/api/auth/captcha")
+        )
+
+        if is_api_route and not is_public_api:
+            token = None
+            auth_header = request.headers.get("Authorization", "")
+            if auth_header.startswith("Bearer "):
+                token = auth_header[7:].strip()
+            elif "token" in request.query_params:
+                token = request.query_params.get("token")
+
+            if not token:
+                return JSONResponse(
+                    status_code=401,
+                    content={"success": False, "error": "请先登录系统", "code": "UNAUTHORIZED"}
+                )
+
+            payload = verify_token(token)
+            if not payload:
+                return JSONResponse(
+                    status_code=401,
+                    content={"success": False, "error": "登录凭据已过期或无效，请重新登录", "code": "INVALID_TOKEN"}
+                )
+
+            request.state.user = payload
+
+        return await call_next(request)
+
+
+app.add_middleware(AuthMiddleware)
+
+
+# ==============================================================================
+# 用户认证与图形验证码端点
+# ==============================================================================
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+    captcha_id: str
+    captcha_code: str
+
+
+@app.get("/api/auth/captcha")
+async def api_get_captcha():
+    """获取纯 SVG 图形验证码与唯一标识 ID"""
+    data = generate_svg_captcha()
+    return {"success": True, "data": data}
+
+
+@app.post("/api/auth/login")
+async def api_login(req: LoginRequest):
+    """管理员账号密码与图形验证码登录"""
+    if not verify_captcha(req.captcha_id, req.captcha_code):
+        return JSONResponse(
+            status_code=400,
+            content={"success": False, "error": "验证码错误或已过期，请点击验证码刷新重试", "code": "CAPTCHA_ERROR"}
+        )
+
+    if not authenticate_user(req.username, req.password):
+        return JSONResponse(
+            status_code=401,
+            content={"success": False, "error": "用户名或密码错误", "code": "AUTH_FAILED"}
+        )
+
+    token = create_token(req.username)
+    return {
+        "success": True,
+        "token": token,
+        "user": {
+            "username": req.username,
+        },
+        "message": "登录成功！"
+    }
+
+
+@app.get("/api/auth/me")
+async def api_get_me(request: Request):
+    """获取当前登录用户信息 (已受 AuthMiddleware 保护)"""
+    user = getattr(request.state, "user", None)
+    username = user.get("sub", "admin") if user else "admin"
+    return {"success": True, "user": {"username": username}}
+
+
+@app.post("/api/auth/logout")
+async def api_logout():
+    """退出登录"""
+    return {"success": True, "message": "已成功退出登录"}
+
 
 current_process: Optional[Any] = None
 process_lock = asyncio.Lock()
@@ -291,6 +408,171 @@ async def get_monitor_candidates():
         return {"success": False, "error": str(e), "data": [], "count": 0}
 
 
+# ==============================================================================
+# 选股 Agent 评测与中间步骤诊断 RESTful API
+# ==============================================================================
+class EvalRunRequest(BaseModel):
+    mode: str = "benchmark"  # benchmark | offline | live
+    topic: str = ""
+    case: str = "local_cache"
+    use_llm_judge: bool = True
+
+
+@app.get("/api/eval/reports")
+async def get_eval_reports():
+    """获取所有历史评测报告列表及概览"""
+    try:
+        report_dir = os.path.join(os.path.dirname(__file__), "eval", "reports")
+        if not os.path.exists(report_dir):
+            return {"success": True, "data": [], "count": 0}
+
+        import glob
+        import json
+        json_files = glob.glob(os.path.join(report_dir, "*.json"))
+        reports = []
+        for jf in sorted(json_files, key=os.path.getmtime, reverse=True):
+            try:
+                with open(jf, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    base_name = os.path.splitext(os.path.basename(jf))[0]
+                    reports.append({
+                        "eval_id": data.get("eval_id"),
+                        "target_topic": data.get("target_topic"),
+                        "evaluation_time": data.get("evaluation_time"),
+                        "total_score": data.get("total_score"),
+                        "total_grade": data.get("total_grade"),
+                        "rule_score": data.get("rule_score"),
+                        "llm_judge_score": data.get("llm_judge_score"),
+                        "execution_duration": data.get("execution_duration"),
+                        "json_file": jf,
+                        "md_file": os.path.join(report_dir, f"{base_name}.md"),
+                        "html_file": os.path.join(report_dir, f"{base_name}.html"),
+                    })
+            except Exception:
+                continue
+        return {"success": True, "data": reports, "count": len(reports)}
+    except Exception as e:
+        return {"success": False, "error": str(e), "data": [], "count": 0}
+
+
+@app.post("/api/eval/run")
+async def trigger_eval_run(req: Optional[EvalRunRequest] = None):
+    """一键触发选股 Agent 评测并输出评测报告与分数 (子进程独立沙箱执行，确保加载最新代码)"""
+    try:
+        import glob
+        import json
+
+        mode = req.mode if req else "benchmark"
+        topic = req.topic if req else ""
+        case = req.case if req else "local_cache"
+        use_llm = req.use_llm_judge if req else True
+
+        eval_script = os.path.join(os.getcwd(), "eval", "run_eval.py")
+        cmd = [
+            sys.executable,
+            "-u",
+            eval_script,
+            "--mode",
+            mode,
+        ]
+        if topic:
+            cmd.extend(["--topic", topic])
+        if case and mode == "benchmark":
+            cmd.extend(["--case", case])
+        if not use_llm:
+            cmd.append("--no-judge")
+
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+
+        loop = asyncio.get_running_loop()
+
+        def _exec():
+            return subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+                cwd=os.getcwd(),
+            )
+
+        proc = await loop.run_in_executor(None, _exec)
+
+        # 读取本次运行最新生成的评测 JSON 报告
+        report_dir = os.path.join(os.getcwd(), "eval", "reports")
+        json_files = glob.glob(os.path.join(report_dir, "*.json"))
+        latest_data = None
+        if json_files:
+            latest_file = max(json_files, key=os.path.getmtime)
+            with open(latest_file, "r", encoding="utf-8") as f:
+                latest_data = json.load(f)
+
+        if latest_data:
+            return {
+                "success": True,
+                "data": latest_data,
+                "message": f"评测执行完成！总分: {latest_data.get('total_score')} ({latest_data.get('total_grade')})",
+                "stdout": proc.stdout[-1500:] if proc.stdout else "",
+            }
+        else:
+            return {
+                "success": False,
+                "error": "未检测到新生成的评测报告文件",
+                "stdout": proc.stdout,
+                "stderr": proc.stderr,
+            }
+    except Exception as e:
+        import traceback
+        return {"success": False, "error": str(e), "traceback": traceback.format_exc()}
+
+
+@app.get("/api/eval/reports/{report_name}/html")
+async def get_eval_report_html(report_name: str):
+    """直接查看交互式 HTML 评测仪表盘"""
+    try:
+        report_dir = os.path.join(os.path.dirname(__file__), "eval", "reports")
+        if not report_name.endswith(".html"):
+            report_name = f"{report_name}.html"
+        file_path = os.path.join(report_dir, report_name)
+        if not os.path.exists(file_path):
+            clean_prefix = report_name.replace(".html", "")
+            candidates = [f for f in os.listdir(report_dir) if clean_prefix in f and f.endswith(".html")]
+            if candidates:
+                file_path = os.path.join(report_dir, candidates[0])
+            else:
+                return Response(content="<h1>404 Report Not Found</h1>", media_type="text/html", status_code=404)
+        with open(file_path, "r", encoding="utf-8") as f:
+            html = f.read()
+        return Response(content=html, media_type="text/html")
+    except Exception as e:
+        return Response(content=f"Error: {e}", media_type="text/plain", status_code=500)
+
+
+@app.get("/api/eval/reports/{report_name}/json")
+async def get_eval_report_json(report_name: str):
+    """获取单个评测报告的完整 JSON 数据"""
+    try:
+        report_dir = os.path.join(os.path.dirname(__file__), "eval", "reports")
+        if not report_name.endswith(".json"):
+            report_name = f"{report_name}.json"
+        file_path = os.path.join(report_dir, report_name)
+        if not os.path.exists(file_path):
+            clean_prefix = report_name.replace(".json", "")
+            candidates = [f for f in os.listdir(report_dir) if clean_prefix in f and f.endswith(".json")]
+            if candidates:
+                file_path = os.path.join(report_dir, candidates[0])
+            else:
+                return {"success": False, "error": "Report not found"}
+        import json
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {"success": True, "data": data}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
 
 @app.post("/api/stop")
 async def stop_execution():
@@ -322,11 +604,25 @@ async def stop_execution():
 async def websocket_run(websocket: WebSocket):
     """
     WebSocket 实时双工通信：
-    1. 接收客户端参数
-    2. 无缓冲读取 stdout 并立即推送到前端
-    3. 支持客户端随时发送 {"action": "stop"} 中止
+    1. 校验鉴权 Token 凭据
+    2. 接收客户端参数
+    3. 无缓冲读取 stdout 并立即推送到前端
+    4. 支持客户端随时发送 {"action": "stop"} 中止
     """
     global current_process
+
+    # 鉴权凭证检验 (未提供有效 Token 立即断开)
+    token = websocket.query_params.get("token")
+    user_payload = verify_token(token) if token else None
+    if not user_payload:
+        await websocket.accept()
+        await websocket.send_json({
+            "type": "error",
+            "content": "❌ [鉴权拒绝] 缺少有效登录令牌或登录凭证已过期，请重新登录系统！\n"
+        })
+        await websocket.close(code=1008)
+        return
+
     await websocket.accept()
 
     try:
@@ -458,6 +754,15 @@ async def websocket_run(websocket: WebSocket):
             })
         except Exception:
             pass
+
+
+# ==============================================================================
+# 挂载前端 React 打包产物 (若 frontend/dist 存在，则通过 FastAPI 直接托管生产界面)
+# ==============================================================================
+frontend_dist = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend", "dist")
+if os.path.exists(frontend_dist):
+    from fastapi.staticfiles import StaticFiles
+    app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="frontend")
 
 
 if __name__ == "__main__":

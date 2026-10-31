@@ -27,10 +27,14 @@ if hasattr(sys.stderr, "reconfigure"):
 _CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_CURRENT_DIR)
 for _d in [_CURRENT_DIR, _PROJECT_ROOT]:
+    _env_prod = os.path.join(_d, ".env.prod")
+    if os.path.exists(_env_prod):
+        load_dotenv(_env_prod)
     _env_path = os.path.join(_d, ".env")
     if os.path.exists(_env_path):
         load_dotenv(_env_path)
-        break
+load_dotenv(".env.prod")
+load_dotenv(".env")
 
 
 def get_mysql_config() -> dict:

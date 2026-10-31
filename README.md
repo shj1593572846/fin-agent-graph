@@ -47,10 +47,20 @@ fin-agent-graph/
 │   ├── stock_chart.py             # 16 宫格实时分时看板服务与行情中心
 │   └── stock_quant.py             # 早盘量化回踩承接分析引擎
 ├── server.py                      # FastAPI 后端服务 (提供 WebSocket 实时流)
-├── frontend/                      # React + Vite 前端看板
+├── eval/                          # 选股 Agent 全生命周期评测与中间步骤诊断套件
+│   ├── run_eval.py                # 评测运行入口 (CLI Runner)
+│   ├── tracer.py                  # 中间步骤追踪与链路插桩器 (Step Tracer)
+│   ├── metrics.py                 # 5大维度、28项确定性规则评分细则
+│   ├── evaluator.py               # 复合评测引擎 (规则体检 + LLM裁判)
+│   ├── report_generator.py        # 多格式研报渲染器 (Markdown / JSON / HTML)
+│   ├── benchmark_cases.py         # 标杆回归测试用例 (牛市/熊市防守)
+│   └── reports/                   # 评测报告自动归档目录 (.md / .json / .html)
+├── frontend/                      # React + Vite 前端看板 (含量化选股、知识库、评测中心)
 │   ├── src/                       # 前端源码
 │   └── package.json               # 前端依赖配置
-├── start.bat                      # Windows 一键全栈启动脚本
+├── [run/](run/)                   # 服务启动与调度脚本中心 ([windows/](run/windows/) / [linux/](run/linux/))
+├── [doc/](doc/)                   # 项目文档中心 ([PRD.md](doc/PRD.md) 完整产品需求文档)
+├── [sql/](sql/)                   # 数据库结构与初始化脚本 ([schema_stock_recommendation.sql](sql/schema_stock_recommendation.sql))
 ├── requirements.txt               # Python 后端依赖库
 ├── .env.example                   # 环境变量模板
 └── .gitignore                     # Git 忽略配置
@@ -89,7 +99,7 @@ cp .env.example .env
 ### 3. 运行方式
 
 #### 方式一：一键启动全栈系统（推荐）
-在项目根目录下双击运行 `start.bat`，系统将自动拉起：
+在项目根目录下运行 [`run/windows/start.bat`](run/windows/start.bat)（或 Linux 执行 `bash run/linux/start.sh`），系统将自动拉起：
 1. **FastAPI 后端服务**：`http://127.0.0.1:8000`
 2. **React 前端工作台**：`http://localhost:5173`
 
@@ -117,3 +127,64 @@ python agent/main.py --no-browser --keep-alive 0
 | `--full` | `flag` | `False` | 开启深度全量模式（重新全量抓取全网数据） |
 | `--keep-alive` | `int` | `10` | 研报生成后保持 16 宫格看板运行的分钟数（`0` 表示生成后立即退出） |
 | `--no-browser` | `flag` | `False` | 静默模式，不自动打开外部浏览器看盘窗口 |
+
+---
+
+## 📊 选股 Agent 深度评测与中间步骤诊断
+
+系统在 `eval/` 目录与前端中提供了完整的 Agent 评测与中间步骤分析系统：
+
+### 1. Web 页面启动与可视化评测 (推荐)
+1. 启动服务（运行 [`run/windows/start.bat`](run/windows/start.bat) 或 `bash run/linux/start.sh`），浏览器访问 `http://localhost:5173`。
+2. 顶部导航栏点击 **「📊 选股评测中心」**。
+3. 选择评测模式（标杆场景、本地缓存、实时链路），支持切换是否启用 LLM 投研专家裁判。
+4. 点击 **「🚀 即刻启动 Agent 评测」**，页面将实时渲染：
+   - 🏆 综合得分（0-100）与等级徽章（S/A/B/C/D）
+   - 📈 五大核心评测维度雷达与得分率
+   - 🔍 Node 1 ~ Node 6 逐节点耗时、达标核验项、扣分项与产物特征
+   - 🤖 资深量化投研专家大模型裁判评语
+   - 🌐 支持一键在新标签页中打开独立的交互式 HTML 仪表盘报告或导出 Markdown/JSON。
+
+### 2. Windows 一键评测启动器
+运行 [`run/windows/start_eval.bat`](run/windows/start_eval.bat)（或 Linux 执行 `bash run/linux/start_eval.sh`），即可通过交互菜单快速启动各类评测模式。
+
+### 3. 命令行评测
+```bash
+# 标杆回归评测 (高动能牛市场景，含LLM专家裁判)
+python eval/run_eval.py --mode benchmark --case local_cache
+
+# 弱势防守场景评测 (空仓风控纪律考核，极速规则模式)
+python eval/run_eval.py --mode benchmark --case bear_defensive --no-llm-judge
+
+# 本地现场产物诊断 (基于 stock_data/ 现场产物出具诊断)
+python eval/run_eval.py --mode offline
+
+# 端到端全链路执行并插桩评测
+python eval/run_eval.py --mode live --topic 人工智能
+```
+
+---
+
+## 🐳 Linux / Docker 一键容器化部署 (方案 B)
+
+项目已完整内置无界面 Linux / Docker 运行套件（内置文泉驿开源中文字体与 Node.js 运行时，彻底解决 K 线中文方块乱码与桌面浏览器弹窗问题）：
+
+### 1. 配置环境变量
+```bash
+cp .env.example .env
+# 编辑 .env，填入你的 OPENAI_API_KEY
+```
+
+### 2. 一键拉起完整集群 (MySQL + Python多Agent + Nginx)
+```bash
+docker compose up -d --build
+```
+
+### 3. 访问系统
+- **主工作台与量化大屏**：浏览器访问 `http://<服务器IP>` (默认 80 端口，由 Nginx 反代) 或 `http://<服务器IP>:8000`
+- **实时 16 宫格分时大屏**：浏览器访问 `http://<服务器IP>:8888` 或 `http://<服务器IP>/chart/`
+- **查看服务日志**：
+  ```bash
+  docker compose logs -f app
+  ```
+

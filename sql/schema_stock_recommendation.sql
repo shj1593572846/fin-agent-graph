@@ -26,11 +26,11 @@ CREATE TABLE IF NOT EXISTS `stock_recommendation` (
     INDEX `idx_is_success` (`is_recommend_success`),
     INDEX `idx_is_monitored` (`is_monitored`),
     UNIQUE KEY `uk_stock_code_buy_date` (`stock_code`, `buy_date`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='股票荐股与收益评估记录表';
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '股票荐股与收益评估记录表';
 
 -- 3. 创建纯中文列名视图（便于直接在可视化工具中查询与展示）
 CREATE OR REPLACE VIEW `v_stock_recommendation` AS
-SELECT 
+SELECT
     `id` AS `主键`,
     `stock_code` AS `股票代码`,
     `stock_name` AS `股票名称`,
@@ -45,9 +45,9 @@ SELECT
 FROM `stock_recommendation`;
 
 -- 4. 示例插入与查询
--- INSERT INTO `stock_recommendation` 
---   (`stock_code`, `stock_name`, `buy_price`, `close_price`, `buy_date`, `next_day_break_price`, `is_recommend_success`) 
--- VALUES 
+-- INSERT INTO `stock_recommendation`
+--   (`stock_code`, `stock_name`, `buy_price`, `close_price`, `buy_date`, `next_day_break_price`, `is_recommend_success`)
+-- VALUES
 --   ('000001', '平安银行', 11.20, 11.58, '2026-10-17', 11.05, 1);
 
 -- SELECT * FROM `v_stock_recommendation`;

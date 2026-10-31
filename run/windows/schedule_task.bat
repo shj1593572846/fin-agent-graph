@@ -1,7 +1,10 @@
 @echo off
 chcp 65001 >nul
+set ROOT_DIR=%~dp0..\..
+cd /d "%ROOT_DIR%"
+
 echo ==============================================================================
-echo  正在将 Node 1 + Node 2 每日定时任务注册至 Windows 系统任务计划程序 (Task Scheduler)...
+echo  [Windows] 正在将 Node 1 + Node 2 每日定时任务注册至 Windows 系统任务计划程序...
 echo ==============================================================================
 
 set TASK_NAME=FinAgent_Daily_Node1_Node2
@@ -10,7 +13,7 @@ where %PYTHON_EXE% >nul 2>nul
 if %errorlevel% neq 0 (
     set PYTHON_EXE=python.exe
 )
-set SCRIPT_PATH=%~dp0agent\run_nodes_1_2.py
+set SCRIPT_PATH=%ROOT_DIR%\agent\run_nodes_1_2.py
 
 echo 任务名称: %TASK_NAME%
 echo 执行时间: 每天 01:30

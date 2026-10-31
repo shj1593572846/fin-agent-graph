@@ -1,0 +1,82 @@
+services:
+  # ============================================================================
+  # 1. MySQL 数据库服务 (自动挂载建表脚本与健康检测)
+  # ============================================================================
+  db:
+    image: mysql:8.0
+    container_name: fin-agent-mysql
+    restart: unless-stopped
+    command: --default-authentication-plugin=mysql_native_password --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_ROOT_PASSWORD: "123456"
+      MYSQL_DATABASE: "stock"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./sql/schema_stock_recommendation.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    ports:
+      - "127.0.0.1:3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p123456"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ============================================================================
+  # 2. Python 后端与 LangGraph 智能体服务 (FastAPI + React SPA + 16宫格看板)
+  # ============================================================================
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fin-agent-app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - ${ENV_FILE:-.env.prod}
+    environment:
+      - MYSQL_HOST=db
+      - MYSQL_PORT=3306
+      - MYSQL_USER=root
+      - MYSQL_PASSWORD=123456
+      - MYSQL_DATABASE=stock
+      - NO_BROWSER=1
+      - PYTHONUNBUFFERED=1
+      - PYTHONIOENCODING=utf-8
+      - FAST_MODE=1
+    ports:
+      - "8000:8000"
+      - "8888:8888"
+    volumes:
+      # 持久化存储数据、研报、生成的 K 线图表与评测结果
+      - ./stock_data:/app/stock_data
+      - ./kline_charts:/app/kline_charts
+      - ./kline_data:/app/kline_data
+      - ./timeline_data:/app/timeline_data
+      - ./rag:/app/rag
+      - ./eval/reports:/app/eval/reports
+
+  # ============================================================================
+  # 3. Caddy 反向代理网关 (提供 80/443 HTTPS、内置自签名TLS证书与 WebSocket 代理)
+  # ============================================================================
+  caddy:
+    image: caddy:alpine
+    container_name: fin-agent-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+
+volumes:
+  mysql_data:
+  caddy_data:
+  caddy_config:
