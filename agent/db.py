@@ -39,8 +39,13 @@ load_dotenv(".env")
 
 def get_mysql_config() -> dict:
     """获取本地 MySQL 连接配置（支持 .env 覆盖，默认 root/123456@127.0.0.1:3306/stock）"""
+    host = os.getenv("MYSQL_HOST", "127.0.0.1")
+    # 宿主机环境自动优化：若未处于 Docker 容器内部且配置为容器服务名 'db'，优先直连 127.0.0.1 杜绝系统 DNS 解析超时
+    if host == "db" and not os.path.exists("/.dockerenv"):
+        host = "127.0.0.1"
+
     return {
-        "host": os.getenv("MYSQL_HOST", "127.0.0.1"),
+        "host": host,
         "port": int(os.getenv("MYSQL_PORT", 3306)),
         "user": os.getenv("MYSQL_USER", "root"),
         "password": os.getenv("MYSQL_PASSWORD", "123456"),
@@ -51,7 +56,7 @@ def get_mysql_config() -> dict:
 
 
 def get_connection():
-    """获取 MySQL 数据库连接（若 stock 数据库不存在则自动创建）"""
+    """获取 MySQL 数据库连接（若 stock 数据库不存在则自动创建，支持 db -> 127.0.0.1 自动回退）"""
     cfg = get_mysql_config()
     db_name = cfg.pop("database", "stock")
     try:
@@ -64,6 +69,15 @@ def get_connection():
                 cur.execute(f"CREATE DATABASE IF NOT EXISTS `{db_name}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;")
             admin_conn.close()
             return pymysql.connect(database=db_name, **cfg)
+        # 如果是因为容器主机名 'db' 在非 Docker 宿主机环境下解析失败 (2003)，自动回退至 127.0.0.1
+        if cfg.get("host") != "127.0.0.1":
+            try:
+                fallback_cfg = dict(cfg)
+                fallback_cfg["host"] = "127.0.0.1"
+                conn = pymysql.connect(database=db_name, **fallback_cfg)
+                return conn
+            except Exception:
+                pass
         raise
 
 

@@ -2038,30 +2038,59 @@ def decision_maker_agent_node(state: ResearchState) -> dict:
     print("=" * 70 + "\n")
     sys.stdout.flush()
 
-    # 提取排名第一的推荐股票，并精准提取【建议低吸买点区间】最高值
+    # 提取排名第一的推荐股票，并精准提取【建议低吸买点区间】最高值 (与 db.py 统一标准)
     top_stock = None
-    if qualified_stocks and len(qualified_stocks) > 0:
-        top_stock = dict(qualified_stocks[0])
-    elif state.get("filtered_stocks") and len(state.get("filtered_stocks")) > 0:
-        top_stock = dict(state.get("filtered_stocks")[0])
+    try:
+        from db import extract_top_stock_from_state
+        temp_state = {
+            "final_decision": final_decision_report,
+            "qualified_stocks": qualified_stocks,
+            "filtered_stocks": state.get("filtered_stocks", []),
+            "top_stock": None,
+        }
+        top_stock = extract_top_stock_from_state(temp_state)
+    except Exception as e:
+        print(f"⚠️ 提取 top_stock 异常: {e}")
 
-    if top_stock:
-        try:
-            from db import extract_buy_order_high_price
-            c = top_stock.get("code") or top_stock.get("股票代码") or ""
-            n = top_stock.get("name") or top_stock.get("股票简称") or ""
-            lp = top_stock.get("latest_price") or top_stock.get("price") or 0.0
-            high_p, raw_int = extract_buy_order_high_price(
-                decision_text=final_decision_report,
-                stock_code=c,
-                stock_name=n,
-                default_price=float(lp) if lp else 0.0,
-            )
-            if high_p > 0:
-                top_stock["buy_price"] = high_p
-                top_stock["buy_price_range"] = raw_int
-        except Exception:
-            pass
+    # 若未提取到，进行多重兜底
+    if not top_stock:
+        if qualified_stocks and len(qualified_stocks) > 0:
+            top_stock = dict(qualified_stocks[0])
+        elif state.get("filtered_stocks") and len(state.get("filtered_stocks")) > 0:
+            top_stock = dict(state.get("filtered_stocks")[0])
+
+        if top_stock:
+            try:
+                from db import extract_buy_order_high_price
+                c = top_stock.get("code") or top_stock.get("股票代码") or ""
+                n = top_stock.get("name") or top_stock.get("股票简称") or ""
+                lp = top_stock.get("latest_price") or top_stock.get("price") or 0.0
+                high_p, raw_int = extract_buy_order_high_price(
+                    decision_text=final_decision_report,
+                    stock_code=c,
+                    stock_name=n,
+                    default_price=float(lp) if lp else 0.0,
+                )
+                if high_p > 0:
+                    top_stock["buy_price"] = high_p
+                    top_stock["buy_price_range"] = raw_int
+            except Exception:
+                pass
+
+    # 持久化最新终审研报与 top_stock 到本地 stock_data/，供离线诊断及评测中心直接准确加载真实产物
+    try:
+        root_dir = get_project_root()
+        s_data_dir = os.path.join(root_dir, "stock_data")
+        os.makedirs(s_data_dir, exist_ok=True)
+        dec_path = os.path.join(s_data_dir, "latest_final_decision.txt")
+        with open(dec_path, "w", encoding="utf-8") as f:
+            f.write(final_decision_report)
+        if top_stock:
+            top_path = os.path.join(s_data_dir, "latest_top_stock.json")
+            with open(top_path, "w", encoding="utf-8") as f:
+                json.dump(top_stock, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        pass
 
     return {
         "final_decision": final_decision_report,

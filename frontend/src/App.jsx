@@ -29,13 +29,13 @@ export default function App() {
   const [keepAlive, setKeepAlive] = useState('0')
   const [fastMode, setFastMode] = useState(true)
   const [status, setStatus] = useState('idle') // 'idle' | 'running' | 'completed' | 'stopped' | 'error'
-  
+
   // 日志列表：每项包含独立行号、所属节点ID、节点名称、换行文本等
   const [logs, setLogs] = useState([])
-  
+
   // 当前控制台过滤标签：0 表示“全部实时流”，1~6 表示只看特定节点
   const [selectedNodeTab, setSelectedNodeTab] = useState(0)
-  
+
   const [filterText, setFilterText] = useState('')
   const [autoScroll, setAutoScroll] = useState(true)
   const [isFullscreen, setIsFullscreen] = useState(false)
@@ -71,7 +71,7 @@ export default function App() {
   const socketRef = useRef(null)
   const terminalRef = useRef(null)
   const timerRef = useRef(null)
-  
+
   // 流式缓冲器与序号计数器
   const streamBufferRef = useRef('')
   const lineCounterRef = useRef(0)
@@ -150,7 +150,7 @@ export default function App() {
   const handleLogout = async () => {
     try {
       await fetch(getApiUrl('/api/auth/logout'), { method: 'POST' })
-    } catch (e) {}
+    } catch (e) { }
     removeToken()
     setIsAuthenticated(false)
     setCurrentUser(null)
@@ -898,442 +898,442 @@ export default function App() {
       {activeMenu === 'stock_selection' && (
         <>
 
-      {/* 六节点拓扑流水线卡片 (点击可快速切换至该节点日志) */}
-      <section className="pipeline-card">
-        <div className="pipeline-header">
-          <div className="pipeline-title">
-            <span>⚡ 多 Agent 协同研判流水线阶段 (点击可单独查看该节点输出)</span>
-          </div>
-          <div className="pipeline-status-text">
-            {activeNode === 0 && <span style={{ color: 'var(--text-muted)', fontSize: '0.8rem' }}>等待启动指令</span>}
-            {activeNode > 0 && (
-              <span style={{ color: 'var(--accent-cyan)', fontSize: '0.8rem', fontWeight: 600 }}>
-                ● 正在执行: {PIPELINE_NODES[activeNode - 1]?.name}
-              </span>
-            )}
-          </div>
-        </div>
-
-        <div className="pipeline-steps">
-          {PIPELINE_NODES.map((node) => {
-            const isDone = activeNode > node.id || status === 'completed'
-            const isActive = activeNode === node.id && status === 'running'
-            const isTabActive = selectedNodeTab === node.id
-            return (
-              <div
-                key={node.id}
-                className={`pipeline-step ${isActive ? 'active' : ''} ${isDone ? 'done' : ''} ${isTabActive ? 'tab-selected' : ''}`}
-                onClick={() => setSelectedNodeTab(node.id)}
-                title={`点击查看 ${node.name} 的独立输出`}
-              >
-                <span className="step-num">{isDone ? '✓ COMPLETED' : `PHASE 0${node.id}`}</span>
-                <span className="step-name">{node.name.replace(`Node ${node.id}: `, '')}</span>
-                <span className="step-desc">{node.desc}</span>
+          {/* 六节点拓扑流水线卡片 (点击可快速切换至该节点日志) */}
+          <section className="pipeline-card">
+            <div className="pipeline-header">
+              <div className="pipeline-title">
+                <span>⚡ 多 Agent 协同研判流水线阶段 (点击可单独查看该节点输出)</span>
               </div>
-            )
-          })}
-        </div>
-      </section>
-
-      {/* 选股启动控制面板 */}
-      <section className="control-panel">
-        <div className="control-main-row">
-          <div className="topic-input-wrapper">
-            <label htmlFor="topic-input">🎯 目标选股板块 / 题材主题 (留空则全市场初筛):</label>
-            <div className="topic-input-container">
-              <span className="topic-icon">🔍</span>
-              <input
-                id="topic-input"
-                type="text"
-                className="topic-input"
-                placeholder="例如: 消费电子 / 新能源 储能 / 银行 / 低空经济 (回车启动)"
-                value={topic}
-                onChange={(e) => setTopic(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && handleStart()}
-                disabled={status === 'running'}
-              />
-            </div>
-          </div>
-
-          <div className="keepalive-wrapper">
-            <label htmlFor="keepalive-select">⏱️ 16宫格看盘保持:</label>
-            <select
-              id="keepalive-select"
-              className="keepalive-select"
-              value={keepAlive}
-              onChange={(e) => setKeepAlive(e.target.value)}
-              disabled={status === 'running'}
-            >
-              <option value="0">0 分钟 (生成后立即退出)</option>
-              <option value="5">5 分钟 (轻度保持看盘)</option>
-              <option value="10">10 分钟 (标准看盘监控)</option>
-              <option value="30">30 分钟 (长时盘中监控)</option>
-            </select>
-          </div>
-
-          <div className="mode-toggle-container">
-            <label>⚡ 运行速度模式:</label>
-            <div className="mode-pill-group">
-              <button
-                type="button"
-                className={`mode-pill-btn ${fastMode ? 'active' : ''}`}
-                onClick={() => setFastMode(true)}
-                disabled={status === 'running'}
-                title="复用本地日线缓存、直接精简调用LLM，全流程~15-25秒"
-              >
-                🚀 极速模式 (~20s)
-              </button>
-              <button
-                type="button"
-                className={`mode-pill-btn ${!fastMode ? 'active' : ''}`}
-                onClick={() => setFastMode(false)}
-                disabled={status === 'running'}
-                title="重新全网抓取全A日线K线数据、全量多轮ReAct推理"
-              >
-                🔄 深度全量模式
-              </button>
-            </div>
-          </div>
-
-          <div className="action-buttons-group">
-            <button
-              id="launch-main-btn"
-              className={`btn-primary-launch ${status === 'running' ? 'running' : ''}`}
-              onClick={handleStart}
-              disabled={status === 'running'}
-            >
-              {status === 'running' ? (
-                <>
-                  <span className="btn-icon-spin">⚙️</span>
-                  <span>选股研判运行中...</span>
-                </>
-              ) : (
-                <>
-                  <span>🚀</span>
-                  <span>一键启动选股决策 (运行 agent/main.py)</span>
-                </>
-              )}
-            </button>
-
-            <button
-              id="stop-main-btn"
-              className="btn-stop"
-              onClick={handleStop}
-              disabled={status !== 'running'}
-              title="强制终止当前正在运行的选股进程"
-            >
-              <span>🛑</span>
-              <span>终止</span>
-            </button>
-          </div>
-        </div>
-
-        {/* 快捷板块标签 */}
-        <div className="preset-chips-row">
-          <span className="preset-label">快捷板块推荐:</span>
-          {PRESET_TOPICS.map((preset) => (
-            <button
-              key={preset.label}
-              className={`preset-chip ${topic === preset.value ? 'active' : ''}`}
-              onClick={() => setTopic(preset.value)}
-              disabled={status === 'running'}
-            >
-              {preset.label}
-            </button>
-          ))}
-        </div>
-      </section>
-
-      {/* 16 宫格实时看板就绪卡片提示 */}
-      {dashboardUrl && (
-        <div className="dashboard-alert-banner">
-          <div className="dashboard-banner-left">
-            <span className="dashboard-banner-icon">🖥️</span>
-            <div className="dashboard-banner-text">
-              <h4>分时 16 宫格实时监控看板大屏已就绪！</h4>
-              <p>可直接在独立大屏窗口中查看多标的分时异动及量化均线回踩承接</p>
-            </div>
-          </div>
-          <a
-            href={dashboardUrl}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="btn-open-grid"
-          >
-            <span>👉 立即打开 16 宫格大屏 ({dashboardUrl})</span>
-          </a>
-        </div>
-      )}
-
-      {/* 数据库荐股入库记录展示卡片 (stock_recommendation) */}
-      <div className={`recommendation-alert-banner ${recommendations.length === 0 ? 'empty-state' : ''}`}>
-        <div className="recommendation-banner-left">
-          <span className="recommendation-banner-icon">{recommendations.length > 0 ? '🏆' : '📌'}</span>
-          <div className="recommendation-banner-text">
-            <div className="recommendation-banner-title">
-              {recommendations.length > 0 ? (
-                <>
-                  <h4>策略第一名已入库 <code>stock_recommendation</code> 表</h4>
-                  <span className="rec-badge-tag">自动排重生效 (股票代码+买入日期唯一)</span>
-                </>
-              ) : (
-                <>
-                  <h4 className="empty-title">数据库 <code>stock_recommendation</code> 荐股记录看板</h4>
-                  <span className="rec-badge-tag empty">等待策略研判入库</span>
-                </>
-              )}
-            </div>
-            {recommendations.length > 0 ? (
-              <div className="recommendation-meta-row">
-                <span className="rec-chip code">股票代码: <strong>{recommendations[0].stock_code}</strong></span>
-                <span className="rec-chip name">股票名称: <strong>{recommendations[0].stock_name}</strong></span>
-                <span className="rec-chip price">买入价格: <strong>¥{Number(recommendations[0].buy_price || 0).toFixed(2)}</strong></span>
-                <span className="rec-chip date">买入日期: <strong>{recommendations[0].buy_date}</strong></span>
-                <span className={`rec-chip monitor ${recommendations[0].is_monitored !== 0 ? 'active' : 'inactive'}`}>
-                  是否监控: <strong>{recommendations[0].is_monitored !== 0 ? '🟢 监控中' : '⚪ 已停止'}</strong>
-                </span>
-                {recommendations[0].next_day_break_price !== null && recommendations[0].next_day_break_price !== undefined && (
-                  <span className={`rec-chip break-price ${recommendations[0].is_recommend_success ? 'profit' : 'loss'}`}>
-                    次日跌破卖出: <strong>¥{Number(recommendations[0].next_day_break_price).toFixed(2)}</strong> ({recommendations[0].is_recommend_success ? '盈利' : '止损'})
+              <div className="pipeline-status-text">
+                {activeNode === 0 && <span style={{ color: 'var(--text-muted)', fontSize: '0.8rem' }}>等待启动指令</span>}
+                {activeNode > 0 && (
+                  <span style={{ color: 'var(--accent-cyan)', fontSize: '0.8rem', fontWeight: 600 }}>
+                    ● 正在执行: {PIPELINE_NODES[activeNode - 1]?.name}
                   </span>
                 )}
-                <span className="rec-chip time">创建时间: <strong>{recommendations[0].created_at}</strong></span>
               </div>
-            ) : (
-              <div className="recommendation-meta-row empty-tip">
-                <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
-                  当前数据库暂无今日荐股。点击“开始执行协同研判”后，系统将全市场精选龙头并在终审时自动将第一名写入 MySQL 表。
-                </span>
-              </div>
-            )}
-          </div>
-        </div>
-        <div className="rec-banner-actions">
-          <button
-            type="button"
-            className="btn-monitor-break-direct"
-            onClick={() => handleDirectMonitorBreakPrices(false)}
-            title="立即执行开市日次日分时跌破均线卖出量化研判"
-          >
-            <span>⚡ 次日跌破均线监控</span>
-          </button>
-          <button
-            type="button"
-            className="btn-sync-close-direct"
-            onClick={handleDirectSyncClosePrices}
-            title="立即查询今日推荐标的并拉取行情回写收盘价"
-          >
-            <span>📊 同步收盘价</span>
-          </button>
-          <button
-            type="button"
-            className="btn-view-recs"
-            onClick={() => {
-              fetchRecommendations()
-              setShowRecModal(true)
-            }}
-            title="查看 stock_recommendation 历史记录"
-          >
-            <span>📋 查看荐股记录 ({recommendations.length} 条)</span>
-          </button>
-          <button
-            type="button"
-            className="btn-open-task-modal"
-            onClick={() => {
-              setActiveMenu('task_management')
-              fetchTasks()
-            }}
-            title="切换至定时任务管理中心"
-          >
-            <span>⏰ 定时任务管理 ({tasks.length})</span>
-          </button>
-        </div>
-      </div>
-
-      {/* 运行时控制台窗口 (Core Window: 节点区分展示与准确换行) */}
-      <section className={`terminal-window-wrapper ${isFullscreen ? 'fullscreen' : ''}`}>
-        {/* 控制台顶部装饰与工具栏 */}
-        <div className="terminal-title-bar">
-          <div className="window-dots-group">
-            <span className="win-dot red"></span>
-            <span className="win-dot yellow"></span>
-            <span className="win-dot green"></span>
-          </div>
-
-          <div className="terminal-title">
-            <span>💻</span>
-            <span>agent/main.py 控制台终端 | 节点分段实时流</span>
-            <span className="terminal-tag">UTF-8 / Unbuffered</span>
-          </div>
-
-          <div className="terminal-actions-group">
-            <input
-              type="text"
-              placeholder="🔍 过滤日志..."
-              className="terminal-filter-input"
-              value={filterText}
-              onChange={(e) => setFilterText(e.target.value)}
-            />
-            <button
-              className={`term-action-btn ${autoScroll ? 'active' : ''}`}
-              onClick={() => setAutoScroll(!autoScroll)}
-              title="切换自动滚动至底部"
-            >
-              <span>⬇️ 自动滚屏: {autoScroll ? '开' : '关'}</span>
-            </button>
-            <button
-              className="term-action-btn"
-              onClick={handleCopyLogs}
-              title="复制当前视图内容"
-            >
-              <span>📋 复制</span>
-            </button>
-            <button
-              className="term-action-btn"
-              onClick={handleDownloadLogs}
-              title="导出全部运行日志"
-            >
-              <span>💾 导出</span>
-            </button>
-            <button
-              className="term-action-btn"
-              onClick={handleClearLogs}
-              title="清空当前控制台"
-            >
-              <span>🧹 清屏</span>
-            </button>
-            <button
-              className="term-action-btn"
-              onClick={() => setIsFullscreen(!isFullscreen)}
-              title="切换全屏视图"
-            >
-              <span>{isFullscreen ? '✕ 退出全屏' : '⛶ 全屏'}</span>
-            </button>
-          </div>
-        </div>
-
-        {/* 节点分段切换选项卡 (Node Tabs Bar) */}
-        <div className="node-tabs-bar">
-          <button
-            className={`node-tab-btn ${selectedNodeTab === 0 ? 'active' : ''}`}
-            onClick={() => setSelectedNodeTab(0)}
-          >
-            <span>🌐 全部实时流</span>
-            <span className="tab-badge-count">{nodeCounts[0]} 行</span>
-          </button>
-
-          {PIPELINE_NODES.map((node) => {
-            const count = nodeCounts[node.id] || 0
-            const isCurrentlyRunning = activeNode === node.id && status === 'running'
-            return (
-              <button
-                key={node.id}
-                className={`node-tab-btn ${selectedNodeTab === node.id ? 'active' : ''}`}
-                onClick={() => setSelectedNodeTab(node.id)}
-              >
-                <span>{node.icon}</span>
-                <span>{node.shortName}</span>
-                <span className="tab-badge-count">{count} 行</span>
-                {isCurrentlyRunning && <span className="tab-pulse-dot" title="节点运行中"></span>}
-              </button>
-            )
-          })}
-        </div>
-
-        {/* 选中单节点时的专属信息横幅 */}
-        {selectedNodeTab > 0 && currentSelectedNodeInfo && (
-          <div className={`node-context-banner node-${selectedNodeTab}`}>
-            <div className="node-context-left">
-              <span>{currentSelectedNodeInfo.icon}</span>
-              <span className="node-context-title">正在查看：{currentSelectedNodeInfo.name}</span>
-              <span className="node-context-desc">({currentSelectedNodeInfo.desc})</span>
             </div>
-            <button
-              className="term-action-btn"
-              onClick={() => setSelectedNodeTab(0)}
-              style={{ fontSize: '0.74rem' }}
-            >
-              <span>↩ 返回全景流式视图</span>
-            </button>
-          </div>
-        )}
 
-        {/* 控制台内容主体 (保留空行、自然换行、高亮分块) */}
-        <div className="terminal-screen" ref={terminalRef}>
-          {displayLogs.length === 0 ? (
-            <div className="terminal-placeholder">
-              <div className="placeholder-icon">📊</div>
-              <div className="placeholder-title">
-                {selectedNodeTab === 0
-                  ? '控制台就绪，等待执行启动'
-                  : `${currentSelectedNodeInfo?.name} 暂无输出数据`}
-              </div>
-              <p className="placeholder-desc">
-                {selectedNodeTab === 0
-                  ? '点击上方 “一键启动选股决策 (运行 agent/main.py)” 按钮，系统将按 Node 1~6 节点自动划分并实时输出控制台内容。'
-                  : '该节点尚未执行或无匹配输出，请点击“返回全景流式视图”或启动选股工作流。'}
-              </p>
-              {selectedNodeTab === 0 && (
-                <div className="placeholder-command-box">
-                  $ python -u agent/main.py {topic ? `--topic "${topic}"` : ''} --keep-alive {keepAlive}
+            <div className="pipeline-steps">
+              {PIPELINE_NODES.map((node) => {
+                const isDone = activeNode > node.id || status === 'completed'
+                const isActive = activeNode === node.id && status === 'running'
+                const isTabActive = selectedNodeTab === node.id
+                return (
+                  <div
+                    key={node.id}
+                    className={`pipeline-step ${isActive ? 'active' : ''} ${isDone ? 'done' : ''} ${isTabActive ? 'tab-selected' : ''}`}
+                    onClick={() => setSelectedNodeTab(node.id)}
+                    title={`点击查看 ${node.name} 的独立输出`}
+                  >
+                    <span className="step-num">{isDone ? '✓ COMPLETED' : `PHASE 0${node.id}`}</span>
+                    <span className="step-name">{node.name.replace(`Node ${node.id}: `, '')}</span>
+                    <span className="step-desc">{node.desc}</span>
+                  </div>
+                )
+              })}
+            </div>
+          </section>
+
+          {/* 选股启动控制面板 */}
+          <section className="control-panel">
+            <div className="control-main-row">
+              <div className="topic-input-wrapper">
+                <label htmlFor="topic-input">🎯 目标选股板块 / 题材主题 (留空则全市场初筛):</label>
+                <div className="topic-input-container">
+                  <span className="topic-icon">🔍</span>
+                  <input
+                    id="topic-input"
+                    type="text"
+                    className="topic-input"
+                    placeholder="例如: 消费电子 / 新能源 储能 / 银行 / 低空经济 (回车启动)"
+                    value={topic}
+                    onChange={(e) => setTopic(e.target.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && handleStart()}
+                    disabled={status === 'running'}
+                  />
                 </div>
-              )}
+              </div>
+
+              <div className="keepalive-wrapper">
+                <label htmlFor="keepalive-select">⏱️ 16宫格看盘保持:</label>
+                <select
+                  id="keepalive-select"
+                  className="keepalive-select"
+                  value={keepAlive}
+                  onChange={(e) => setKeepAlive(e.target.value)}
+                  disabled={status === 'running'}
+                >
+                  <option value="0">0 分钟 (生成后立即退出)</option>
+                  <option value="5">5 分钟 (轻度保持看盘)</option>
+                  <option value="10">10 分钟 (标准看盘监控)</option>
+                  <option value="30">30 分钟 (长时盘中监控)</option>
+                </select>
+              </div>
+
+              <div className="mode-toggle-container">
+                <label>⚡ 运行速度模式:</label>
+                <div className="mode-pill-group">
+                  <button
+                    type="button"
+                    className={`mode-pill-btn ${fastMode ? 'active' : ''}`}
+                    onClick={() => setFastMode(true)}
+                    disabled={status === 'running'}
+                    title="复用本地日线缓存、直接精简调用LLM，全流程~15-25秒"
+                  >
+                    🚀 极速模式 (~20s)
+                  </button>
+                  <button
+                    type="button"
+                    className={`mode-pill-btn ${!fastMode ? 'active' : ''}`}
+                    onClick={() => setFastMode(false)}
+                    disabled={status === 'running'}
+                    title="重新全网抓取全A日线K线数据、全量多轮ReAct推理"
+                  >
+                    🔄 深度全量模式
+                  </button>
+                </div>
+              </div>
+
+              <div className="action-buttons-group">
+                <button
+                  id="launch-main-btn"
+                  className={`btn-primary-launch ${status === 'running' ? 'running' : ''}`}
+                  onClick={handleStart}
+                  disabled={status === 'running'}
+                >
+                  {status === 'running' ? (
+                    <>
+                      <span className="btn-icon-spin">⚙️</span>
+                      <span>选股研判运行中...</span>
+                    </>
+                  ) : (
+                    <>
+                      <span>🚀</span>
+                      <span>一键启动选股决策 (运行 agent/main.py)</span>
+                    </>
+                  )}
+                </button>
+
+                <button
+                  id="stop-main-btn"
+                  className="btn-stop"
+                  onClick={handleStop}
+                  disabled={status !== 'running'}
+                  title="强制终止当前正在运行的选股进程"
+                >
+                  <span>🛑</span>
+                  <span>终止</span>
+                </button>
+              </div>
             </div>
-          ) : (
-            displayLogs.map((item) => (
-              <React.Fragment key={item.id}>
-                {/* 在全景流模式下，当检测到新节点开始时，渲染明显的节点划分卡片 */}
-                {selectedNodeTab === 0 && item.isNewNodeStart && item.nodeId > 0 && (
-                  <div className={`node-section-divider node-${item.nodeId}`}>
-                    <div className="node-divider-badge">
-                      <span className="node-divider-tag">PHASE 0{item.nodeId}</span>
-                      <span>
-                        {PIPELINE_NODES.find((n) => n.id === item.nodeId)?.icon}{' '}
-                        {PIPELINE_NODES.find((n) => n.id === item.nodeId)?.name}
+
+            {/* 快捷板块标签 */}
+            <div className="preset-chips-row">
+              <span className="preset-label">快捷板块推荐:</span>
+              {PRESET_TOPICS.map((preset) => (
+                <button
+                  key={preset.label}
+                  className={`preset-chip ${topic === preset.value ? 'active' : ''}`}
+                  onClick={() => setTopic(preset.value)}
+                  disabled={status === 'running'}
+                >
+                  {preset.label}
+                </button>
+              ))}
+            </div>
+          </section>
+
+          {/* 16 宫格实时看板就绪卡片提示 */}
+          {dashboardUrl && (
+            <div className="dashboard-alert-banner">
+              <div className="dashboard-banner-left">
+                <span className="dashboard-banner-icon">🖥️</span>
+                <div className="dashboard-banner-text">
+                  <h4>分时 16 宫格实时监控看板大屏已就绪！</h4>
+                  <p>可直接在独立大屏窗口中查看多标的分时异动及量化均线回踩承接</p>
+                </div>
+              </div>
+              <a
+                href={dashboardUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="btn-open-grid"
+              >
+                <span>👉 立即打开 16 宫格大屏 ({dashboardUrl})</span>
+              </a>
+            </div>
+          )}
+
+          {/* 数据库荐股入库记录展示卡片 (stock_recommendation) */}
+          <div className={`recommendation-alert-banner ${recommendations.length === 0 ? 'empty-state' : ''}`}>
+            <div className="recommendation-banner-left">
+              <span className="recommendation-banner-icon">{recommendations.length > 0 ? '🏆' : '📌'}</span>
+              <div className="recommendation-banner-text">
+                <div className="recommendation-banner-title">
+                  {recommendations.length > 0 ? (
+                    <>
+                      <h4>策略第一名已入库 </h4>
+                      <span className="rec-badge-tag">自动排重生效 (股票代码+买入日期唯一)</span>
+                    </>
+                  ) : (
+                    <>
+                      <h4 className="empty-title">数据库 <code>stock_recommendation</code> 荐股记录看板</h4>
+                      <span className="rec-badge-tag empty">等待策略研判入库</span>
+                    </>
+                  )}
+                </div>
+                {recommendations.length > 0 ? (
+                  <div className="recommendation-meta-row">
+                    <span className="rec-chip code">股票代码: <strong>{recommendations[0].stock_code}</strong></span>
+                    <span className="rec-chip name">股票名称: <strong>{recommendations[0].stock_name}</strong></span>
+                    <span className="rec-chip price">买入价格: <strong>¥{Number(recommendations[0].buy_price || 0).toFixed(2)}</strong></span>
+                    <span className="rec-chip date">买入日期: <strong>{recommendations[0].buy_date}</strong></span>
+                    <span className={`rec-chip monitor ${recommendations[0].is_monitored !== 0 ? 'active' : 'inactive'}`}>
+                      是否监控: <strong>{recommendations[0].is_monitored !== 0 ? '🟢 监控中' : '⚪ 已停止'}</strong>
+                    </span>
+                    {recommendations[0].next_day_break_price !== null && recommendations[0].next_day_break_price !== undefined && (
+                      <span className={`rec-chip break-price ${recommendations[0].is_recommend_success ? 'profit' : 'loss'}`}>
+                        次日跌破卖出: <strong>¥{Number(recommendations[0].next_day_break_price).toFixed(2)}</strong> ({recommendations[0].is_recommend_success ? '盈利' : '止损'})
                       </span>
-                    </div>
-                    <div className="node-divider-time">阶段开始时间: {item.timestamp}</div>
+                    )}
+                    <span className="rec-chip time">创建时间: <strong>{recommendations[0].created_at}</strong></span>
+                  </div>
+                ) : (
+                  <div className="recommendation-meta-row empty-tip">
+                    <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
+                      当前数据库暂无今日荐股。点击“开始执行协同研判”后，系统将全市场精选龙头并在终审时自动将第一名写入 MySQL 表。
+                    </span>
                   </div>
                 )}
+              </div>
+            </div>
+            <div className="rec-banner-actions">
+              <button
+                type="button"
+                className="btn-monitor-break-direct"
+                onClick={() => handleDirectMonitorBreakPrices(false)}
+                title="立即执行开市日次日分时跌破均线卖出量化研判"
+              >
+                <span>⚡ 次日跌破均线监控</span>
+              </button>
+              <button
+                type="button"
+                className="btn-sync-close-direct"
+                onClick={handleDirectSyncClosePrices}
+                title="立即查询今日推荐标的并拉取行情回写收盘价"
+              >
+                <span>📊 同步收盘价</span>
+              </button>
+              <button
+                type="button"
+                className="btn-view-recs"
+                onClick={() => {
+                  fetchRecommendations()
+                  setShowRecModal(true)
+                }}
+                title="查看 stock_recommendation 历史记录"
+              >
+                <span>📋 查看荐股记录 ({recommendations.length} 条)</span>
+              </button>
+              <button
+                type="button"
+                className="btn-open-task-modal"
+                onClick={() => {
+                  setActiveMenu('task_management')
+                  fetchTasks()
+                }}
+                title="切换至定时任务管理中心"
+              >
+                <span>⏰ 定时任务管理 ({tasks.length})</span>
+              </button>
+            </div>
+          </div>
 
-                {/* 保证每行正确展示，遇到空行时保留标准垂直高度 */}
-                <div className={getLineClassName(item.text)}>
-                  <span className="log-ln">{(item.id).toString().padStart(4, '0')}</span>
-                  <span className="log-content">
-                    {item.text === '' ? (
-                      <span className="log-empty-line">&nbsp;</span>
-                    ) : (
-                      renderLogLineContent(item.text)
-                    )}
-                  </span>
+          {/* 运行时控制台窗口 (Core Window: 节点区分展示与准确换行) */}
+          <section className={`terminal-window-wrapper ${isFullscreen ? 'fullscreen' : ''}`}>
+            {/* 控制台顶部装饰与工具栏 */}
+            <div className="terminal-title-bar">
+              <div className="window-dots-group">
+                <span className="win-dot red"></span>
+                <span className="win-dot yellow"></span>
+                <span className="win-dot green"></span>
+              </div>
+
+              <div className="terminal-title">
+                <span>💻</span>
+                <span>agent/main.py 控制台终端 | 节点分段实时流</span>
+                <span className="terminal-tag">UTF-8 / Unbuffered</span>
+              </div>
+
+              <div className="terminal-actions-group">
+                <input
+                  type="text"
+                  placeholder="🔍 过滤日志..."
+                  className="terminal-filter-input"
+                  value={filterText}
+                  onChange={(e) => setFilterText(e.target.value)}
+                />
+                <button
+                  className={`term-action-btn ${autoScroll ? 'active' : ''}`}
+                  onClick={() => setAutoScroll(!autoScroll)}
+                  title="切换自动滚动至底部"
+                >
+                  <span>⬇️ 自动滚屏: {autoScroll ? '开' : '关'}</span>
+                </button>
+                <button
+                  className="term-action-btn"
+                  onClick={handleCopyLogs}
+                  title="复制当前视图内容"
+                >
+                  <span>📋 复制</span>
+                </button>
+                <button
+                  className="term-action-btn"
+                  onClick={handleDownloadLogs}
+                  title="导出全部运行日志"
+                >
+                  <span>💾 导出</span>
+                </button>
+                <button
+                  className="term-action-btn"
+                  onClick={handleClearLogs}
+                  title="清空当前控制台"
+                >
+                  <span>🧹 清屏</span>
+                </button>
+                <button
+                  className="term-action-btn"
+                  onClick={() => setIsFullscreen(!isFullscreen)}
+                  title="切换全屏视图"
+                >
+                  <span>{isFullscreen ? '✕ 退出全屏' : '⛶ 全屏'}</span>
+                </button>
+              </div>
+            </div>
+
+            {/* 节点分段切换选项卡 (Node Tabs Bar) */}
+            <div className="node-tabs-bar">
+              <button
+                className={`node-tab-btn ${selectedNodeTab === 0 ? 'active' : ''}`}
+                onClick={() => setSelectedNodeTab(0)}
+              >
+                <span>🌐 全部实时流</span>
+                <span className="tab-badge-count">{nodeCounts[0]} 行</span>
+              </button>
+
+              {PIPELINE_NODES.map((node) => {
+                const count = nodeCounts[node.id] || 0
+                const isCurrentlyRunning = activeNode === node.id && status === 'running'
+                return (
+                  <button
+                    key={node.id}
+                    className={`node-tab-btn ${selectedNodeTab === node.id ? 'active' : ''}`}
+                    onClick={() => setSelectedNodeTab(node.id)}
+                  >
+                    <span>{node.icon}</span>
+                    <span>{node.shortName}</span>
+                    <span className="tab-badge-count">{count} 行</span>
+                    {isCurrentlyRunning && <span className="tab-pulse-dot" title="节点运行中"></span>}
+                  </button>
+                )
+              })}
+            </div>
+
+            {/* 选中单节点时的专属信息横幅 */}
+            {selectedNodeTab > 0 && currentSelectedNodeInfo && (
+              <div className={`node-context-banner node-${selectedNodeTab}`}>
+                <div className="node-context-left">
+                  <span>{currentSelectedNodeInfo.icon}</span>
+                  <span className="node-context-title">正在查看：{currentSelectedNodeInfo.name}</span>
+                  <span className="node-context-desc">({currentSelectedNodeInfo.desc})</span>
                 </div>
-              </React.Fragment>
-            ))
-          )}
-        </div>
+                <button
+                  className="term-action-btn"
+                  onClick={() => setSelectedNodeTab(0)}
+                  style={{ fontSize: '0.74rem' }}
+                >
+                  <span>↩ 返回全景流式视图</span>
+                </button>
+              </div>
+            )}
 
-        {/* 控制台底部状态栏 */}
-        <div className="terminal-footer-bar">
-          <div className="terminal-footer-left">
-            <span className={`status-badge ${status}`}>
-              {status === 'idle' && 'STATUS: READY (就绪)'}
-              {status === 'running' && 'STATUS: STREAMING (正在输出)'}
-              {status === 'completed' && 'STATUS: SUCCESS (全部研报生成完毕)'}
-              {status === 'stopped' && 'STATUS: STOPPED (已中止)'}
-              {status === 'error' && 'STATUS: ERROR (执行异常)'}
-            </span>
-            <span>
-              当前视图: {selectedNodeTab === 0 ? '全景流' : `Node ${selectedNodeTab}`} | 共 {displayLogs.length} 行
-            </span>
-          </div>
+            {/* 控制台内容主体 (保留空行、自然换行、高亮分块) */}
+            <div className="terminal-screen" ref={terminalRef}>
+              {displayLogs.length === 0 ? (
+                <div className="terminal-placeholder">
+                  <div className="placeholder-icon">📊</div>
+                  <div className="placeholder-title">
+                    {selectedNodeTab === 0
+                      ? '控制台就绪，等待执行启动'
+                      : `${currentSelectedNodeInfo?.name} 暂无输出数据`}
+                  </div>
+                  <p className="placeholder-desc">
+                    {selectedNodeTab === 0
+                      ? '点击上方 “一键启动选股决策 (运行 agent/main.py)” 按钮，系统将按 Node 1~6 节点自动划分并实时输出控制台内容。'
+                      : '该节点尚未执行或无匹配输出，请点击“返回全景流式视图”或启动选股工作流。'}
+                  </p>
+                  {selectedNodeTab === 0 && (
+                    <div className="placeholder-command-box">
+                      $ python -u agent/main.py {topic ? `--topic "${topic}"` : ''} --keep-alive {keepAlive}
+                    </div>
+                  )}
+                </div>
+              ) : (
+                displayLogs.map((item) => (
+                  <React.Fragment key={item.id}>
+                    {/* 在全景流模式下，当检测到新节点开始时，渲染明显的节点划分卡片 */}
+                    {selectedNodeTab === 0 && item.isNewNodeStart && item.nodeId > 0 && (
+                      <div className={`node-section-divider node-${item.nodeId}`}>
+                        <div className="node-divider-badge">
+                          <span className="node-divider-tag">PHASE 0{item.nodeId}</span>
+                          <span>
+                            {PIPELINE_NODES.find((n) => n.id === item.nodeId)?.icon}{' '}
+                            {PIPELINE_NODES.find((n) => n.id === item.nodeId)?.name}
+                          </span>
+                        </div>
+                        <div className="node-divider-time">阶段开始时间: {item.timestamp}</div>
+                      </div>
+                    )}
 
-          <div className="terminal-footer-right">
-            <span>⏱️ 耗时: {formatTimer(elapsedTime)}</span>
-            <span>PID: {status === 'running' ? 'Active' : 'None'}</span>
-          </div>
-        </div>
-      </section>
-      </>
+                    {/* 保证每行正确展示，遇到空行时保留标准垂直高度 */}
+                    <div className={getLineClassName(item.text)}>
+                      <span className="log-ln">{(item.id).toString().padStart(4, '0')}</span>
+                      <span className="log-content">
+                        {item.text === '' ? (
+                          <span className="log-empty-line">&nbsp;</span>
+                        ) : (
+                          renderLogLineContent(item.text)
+                        )}
+                      </span>
+                    </div>
+                  </React.Fragment>
+                ))
+              )}
+            </div>
+
+            {/* 控制台底部状态栏 */}
+            <div className="terminal-footer-bar">
+              <div className="terminal-footer-left">
+                <span className={`status-badge ${status}`}>
+                  {status === 'idle' && 'STATUS: READY (就绪)'}
+                  {status === 'running' && 'STATUS: STREAMING (正在输出)'}
+                  {status === 'completed' && 'STATUS: SUCCESS (全部研报生成完毕)'}
+                  {status === 'stopped' && 'STATUS: STOPPED (已中止)'}
+                  {status === 'error' && 'STATUS: ERROR (执行异常)'}
+                </span>
+                <span>
+                  当前视图: {selectedNodeTab === 0 ? '全景流' : `Node ${selectedNodeTab}`} | 共 {displayLogs.length} 行
+                </span>
+              </div>
+
+              <div className="terminal-footer-right">
+                <span>⏱️ 耗时: {formatTimer(elapsedTime)}</span>
+                <span>PID: {status === 'running' ? 'Active' : 'None'}</span>
+              </div>
+            </div>
+          </section>
+        </>
       )}
 
       {/* ⏰ 定时任务管理 主页面内容 */}
@@ -1469,9 +1469,8 @@ export default function App() {
                             <span className="task-slider"></span>
                           </label>
                           <span
-                            className={`task-switch-label ${
-                              t.enabled ? 'enabled' : 'disabled'
-                            }`}
+                            className={`task-switch-label ${t.enabled ? 'enabled' : 'disabled'
+                              }`}
                           >
                             {t.enabled ? '运行中' : '已暂停'}
                           </span>
@@ -1500,13 +1499,12 @@ export default function App() {
                               <>
                                 <span>{t.last_run_time}</span>
                                 <span
-                                  className={`task-status-pill ${
-                                    t.last_status === 'success'
-                                      ? 'status-success'
-                                      : t.last_status === 'running'
+                                  className={`task-status-pill ${t.last_status === 'success'
+                                    ? 'status-success'
+                                    : t.last_status === 'running'
                                       ? 'status-running'
                                       : 'status-error'
-                                  }`}
+                                    }`}
                                 >
                                   {t.last_status === 'success' && '✓ 成功'}
                                   {t.last_status === 'running' && '● 运行中'}
@@ -1716,9 +1714,8 @@ export default function App() {
                   <div className="script-presets-group">
                     <button
                       type="button"
-                      className={`script-preset-btn ${
-                        taskFormData.python_script === 'agent/sync_close_price.py' ? 'active' : ''
-                      }`}
+                      className={`script-preset-btn ${taskFormData.python_script === 'agent/sync_close_price.py' ? 'active' : ''
+                        }`}
                       onClick={() =>
                         setTaskFormData({
                           ...taskFormData,
@@ -1738,9 +1735,8 @@ export default function App() {
                     </button>
                     <button
                       type="button"
-                      className={`script-preset-btn ${
-                        taskFormData.python_script === 'agent/main.py' ? 'active' : ''
-                      }`}
+                      className={`script-preset-btn ${taskFormData.python_script === 'agent/main.py' ? 'active' : ''
+                        }`}
                       onClick={() =>
                         setTaskFormData({
                           ...taskFormData,
@@ -1760,9 +1756,8 @@ export default function App() {
                     </button>
                     <button
                       type="button"
-                      className={`script-preset-btn ${
-                        taskFormData.python_script === 'agent/run_nodes_1_2.py' ? 'active' : ''
-                      }`}
+                      className={`script-preset-btn ${taskFormData.python_script === 'agent/run_nodes_1_2.py' ? 'active' : ''
+                        }`}
                       onClick={() =>
                         setTaskFormData({
                           ...taskFormData,
@@ -1807,9 +1802,8 @@ export default function App() {
                   <div className="cron-presets-group">
                     <button
                       type="button"
-                      className={`cron-preset-btn ${
-                        taskFormData.cron_expr === '30 1 * * *' ? 'active' : ''
-                      }`}
+                      className={`cron-preset-btn ${taskFormData.cron_expr === '30 1 * * *' ? 'active' : ''
+                        }`}
                       onClick={() =>
                         setTaskFormData({ ...taskFormData, cron_expr: '30 1 * * *' })
                       }
@@ -1818,9 +1812,8 @@ export default function App() {
                     </button>
                     <button
                       type="button"
-                      className={`cron-preset-btn ${
-                        taskFormData.cron_expr === '10 15 * * 1-5' ? 'active' : ''
-                      }`}
+                      className={`cron-preset-btn ${taskFormData.cron_expr === '10 15 * * 1-5' ? 'active' : ''
+                        }`}
                       onClick={() =>
                         setTaskFormData({ ...taskFormData, cron_expr: '10 15 * * 1-5' })
                       }
@@ -1829,9 +1822,8 @@ export default function App() {
                     </button>
                     <button
                       type="button"
-                      className={`cron-preset-btn ${
-                        taskFormData.cron_expr === '30 9 * * 1-5' ? 'active' : ''
-                      }`}
+                      className={`cron-preset-btn ${taskFormData.cron_expr === '30 9 * * 1-5' ? 'active' : ''
+                        }`}
                       onClick={() =>
                         setTaskFormData({ ...taskFormData, cron_expr: '30 9 * * 1-5' })
                       }
@@ -1840,9 +1832,8 @@ export default function App() {
                     </button>
                     <button
                       type="button"
-                      className={`cron-preset-btn ${
-                        taskFormData.cron_expr === '0 10 15 * * ?' ? 'active' : ''
-                      }`}
+                      className={`cron-preset-btn ${taskFormData.cron_expr === '0 10 15 * * ?' ? 'active' : ''
+                        }`}
                       onClick={() =>
                         setTaskFormData({ ...taskFormData, cron_expr: '0 10 15 * * ?' })
                       }
@@ -1851,9 +1842,8 @@ export default function App() {
                     </button>
                     <button
                       type="button"
-                      className={`cron-preset-btn ${
-                        taskFormData.cron_expr === '15:10' ? 'active' : ''
-                      }`}
+                      className={`cron-preset-btn ${taskFormData.cron_expr === '15:10' ? 'active' : ''
+                        }`}
                       onClick={() =>
                         setTaskFormData({ ...taskFormData, cron_expr: '15:10' })
                       }
@@ -1862,9 +1852,8 @@ export default function App() {
                     </button>
                     <button
                       type="button"
-                      className={`cron-preset-btn ${
-                        taskFormData.cron_expr === '09:30' ? 'active' : ''
-                      }`}
+                      className={`cron-preset-btn ${taskFormData.cron_expr === '09:30' ? 'active' : ''
+                        }`}
                       onClick={() =>
                         setTaskFormData({ ...taskFormData, cron_expr: '09:30' })
                       }
