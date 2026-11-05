@@ -183,6 +183,22 @@ async def startup_event():
     except Exception as e:
         print(f"⚠️ [FastAPI Startup] 启动 RAG 知识库失败: {e}")
 
+    try:
+        import socket
+        import threading
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        is_port_in_use = (sock.connect_ex(("127.0.0.1", 8888)) == 0)
+        sock.close()
+        if not is_port_in_use:
+            from agent import stock_chart
+            chart_thread = threading.Thread(target=stock_chart.start_server, daemon=True)
+            chart_thread.start()
+            print("📊 [FastAPI Startup] 16宫格实时分时看板后台服务已在端口 8888 启动并常驻就绪！")
+        else:
+            print("📊 [FastAPI Startup] 16宫格看板服务已在端口 8888 常驻运行中。")
+    except Exception as e:
+        print(f"⚠️ [FastAPI Startup] 启动 16 宫格看板服务异常: {e}")
+
 
 # 挂载 RAG 研报分析与财报解读知识库模块路由
 from rag import rag_router

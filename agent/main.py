@@ -103,23 +103,21 @@ def run_research_pipeline(topic: str, keep_alive_minutes: int = 10) -> str:
         print(f"⚠️ [数据库提示] 写入 stock_recommendation 表异常: {str(e)}\n")
         sys.stdout.flush()
 
-    # 延迟保持 16 宫格网页看板服务运行 (默认 10 分钟，支持 Ctrl+C 随时安全退出)
+    # 🌐 保持 16 宫格网页看板与达标网格常驻打开状态 (根据需求：保持页面的打开状态，不用自动关闭)
     if keep_alive_minutes > 0:
         dash_urls = final_state.get('dashboard_urls', [final_state.get('dashboard_url', 'http://127.0.0.1:8888')])
-        total_seconds = keep_alive_minutes * 60
+        qualified_url = final_state.get('qualified_dashboard_url', 'http://127.0.0.1:8888/?view=qualified')
         print("=" * 80)
-        print(f"🌐 【16宫格网页看板保持运行中】实时分时大屏窗口: {dash_urls}")
-        print(f"⏱️ 进程将保持服务 {keep_alive_minutes} 分钟供实时看盘与监控 (按 Ctrl+C 可随时退出)...")
+        print(f"🌐 【16宫格网页看板常驻运行中】全景分时大屏: {dash_urls}")
+        if final_state.get("qualified_stocks"):
+            print(f"🎯 【量化达标个股分时网格 (已标注触发点位)】: {qualified_url}")
+        print("⏱️ 页面与看盘服务将持续保持常驻打开与实时秒级刷新状态，不自动关闭 (按 Ctrl+C 可随时安全退出)...")
         print("=" * 80)
         try:
-            for remaining in range(total_seconds, 0, -1):
-                mins, secs = divmod(remaining, 60)
-                sys.stdout.write(f"\r⏳ 16宫格看盘服务保持运行中... 倒计时: {mins:02d}分{secs:02d}秒 (按 Ctrl+C 可提前退出)")
-                sys.stdout.flush()
-                time.sleep(1)
-            print("\n\n⏰ 10分钟保持时间结束，16宫格服务已正常关闭。")
+            while True:
+                time.sleep(2)
         except KeyboardInterrupt:
-            print("\n\n🛑 检测到中断信号，16宫格后台服务已安全退出。")
+            print("\n\n🛑 检测到中断信号，16宫格后台看盘服务已安全退出。")
 
     
 

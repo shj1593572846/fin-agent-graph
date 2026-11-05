@@ -5,7 +5,7 @@ import re
 import os
 import threading
 import webbrowser
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from concurrent.futures import ThreadPoolExecutor
 import requests
@@ -39,8 +39,9 @@ DEFAULT_STOCKS = [
     "000333",  # 美的集团
 ]
 
-WEB_PORT = 8888
-HTTP_HOST = "127.0.0.1"
+WEB_PORT = int(os.getenv("WEB_PORT", "8888"))
+HTTP_HOST = os.getenv("DASHBOARD_HOST", "0.0.0.0")
+DISPLAY_HOST = os.getenv("DASHBOARD_PUBLIC_HOST", "127.0.0.1" if HTTP_HOST == "0.0.0.0" else HTTP_HOST)
 
 
 # ==============================================================================
@@ -51,12 +52,66 @@ class StockDataHub:
         self.symbols = list(symbols or DEFAULT_STOCKS)
         self.lock = threading.Lock()
         self.stock_cache = {}  # {code: {info & minute_bars}}
+        self.trigger_stocks = {}  # {code: {code, name, score, trigger_time, trigger_price, ...}}
         self.is_running = True
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Referer": "https://finance.sina.com.cn"
         })
+        self._load_trigger_cache()
+
+    def _load_trigger_cache(self):
+        """尝试从本地 stock_data/qualified_stocks_morning.json 预载量化达标记录"""
+        try:
+            cand_paths = [
+                os.path.join(os.path.dirname(os.path.dirname(__file__)), "stock_data", "qualified_stocks_morning.json"),
+                os.path.join(os.getcwd(), "stock_data", "qualified_stocks_morning.json"),
+                os.path.join("stock_data", "qualified_stocks_morning.json"),
+            ]
+            for p in cand_paths:
+                if os.path.exists(p):
+                    with open(p, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    if isinstance(data, list):
+                        for item in data:
+                            code = str(item.get("code", "")).strip().split(".")[0]
+                            if code:
+                                self.trigger_stocks[code] = item
+                        print(f"🎯 [量化达标缓存预载] 已从 {p} 预载 {len(self.trigger_stocks)} 只达标标的及触发点位")
+                        break
+        except Exception:
+            pass
+
+    def set_trigger_stocks(self, stocks_list):
+        """设置并动态注入量化达标个股及触发点位元数据"""
+        clean_map = {}
+        with self.lock:
+            for s in stocks_list:
+                raw_code = str(s.get("code", "")).strip().split(".")[0]
+                if raw_code and len(raw_code) == 6 and raw_code.isdigit():
+                    clean_map[raw_code] = dict(s)
+                    if raw_code not in self.symbols:
+                        self.symbols.append(raw_code)
+            self.trigger_stocks = clean_map
+            print(f"🎯 [量化达标注入] 已同步 {len(self.trigger_stocks)} 只达标标的及触发点位: {list(self.trigger_stocks.keys())}")
+        self.refresh_all_once()
+
+    def get_trigger_stocks_data(self):
+        """获取所有量化达标个股的实时分时数据并注入 trigger_info 标记"""
+        with self.lock:
+            ordered_data = []
+            for code, t_info in self.trigger_stocks.items():
+                item = self.stock_cache.get(code)
+                if not item:
+                    item = self.fetch_single_stock(code)
+                    if item:
+                        self.stock_cache[code] = item
+                if item:
+                    st_copy = dict(item)
+                    st_copy["trigger_info"] = t_info
+                    ordered_data.append(st_copy)
+            return ordered_data
 
     def set_symbols(self, new_symbols):
         """动态更新监控股票 (支持多窗口，每页16只)"""
@@ -180,7 +235,10 @@ class StockDataHub:
             ordered_data = []
             for s in self.symbols:
                 if s in self.stock_cache:
-                    ordered_data.append(self.stock_cache[s])
+                    st_copy = dict(self.stock_cache[s])
+                    if s in self.trigger_stocks:
+                        st_copy["trigger_info"] = self.trigger_stocks[s]
+                    ordered_data.append(st_copy)
             return ordered_data
 
     def get_page_data(self, page=1, page_size=16):
@@ -195,7 +253,10 @@ class StockDataHub:
             ordered_data = []
             for s in page_symbols:
                 if s in self.stock_cache:
-                    ordered_data.append(self.stock_cache[s])
+                    st_copy = dict(self.stock_cache[s])
+                    if s in self.trigger_stocks:
+                        st_copy["trigger_info"] = self.trigger_stocks[s]
+                    ordered_data.append(st_copy)
             return ordered_data
 
     def get_pages_meta(self, page_size=16):
@@ -210,7 +271,7 @@ class StockDataHub:
                     "page": p,
                     "count": len(p_syms),
                     "symbols": p_syms,
-                    "url": f"http://{HTTP_HOST}:{WEB_PORT}/?page={p}"
+                    "url": f"http://{DISPLAY_HOST}:{WEB_PORT}/?page={p}"
                 })
             return {
                 "total_stocks": total,
@@ -588,9 +649,12 @@ FRONTEND_HTML = """<!DOCTYPE html>
   </main>
 
   <script>
-    // 当前窗口页码（通过 URL 参数 ?page=1, ?page=2 传递）
+    // 当前窗口页码（通过 URL 参数 ?page=1, ?page=2 或 ?view=qualified 传递）
     const urlParams = new URLSearchParams(window.location.search);
+    const viewMode = urlParams.get('view') || urlParams.get('mode') || 'normal';
+    const isQualifiedView = (viewMode === 'qualified' || window.location.pathname.includes('/qualified'));
     const currentPage = parseInt(urlParams.get('page') || '1', 10);
+    const BASE_PATH = window.location.pathname.startsWith('/chart') ? '/chart' : '';
 
     // 渲染槽位与时间轴 (全天 240 分钟映射)
     const TOTAL_SLOTS = 240;
@@ -625,13 +689,21 @@ FRONTEND_HTML = """<!DOCTYPE html>
 
     async function fetchStocksData() {
       try {
-        const resp = await fetch(`/api/stocks?page=${currentPage}`);
+        const fetchUrl = BASE_PATH + (isQualifiedView ? '/api/stocks?view=qualified' : `/api/stocks?page=${currentPage}`);
+        const resp = await fetch(fetchUrl);
         if (resp.ok) {
           const data = await resp.json();
-          if (Array.isArray(data) && data.length > 0) {
+          if (Array.isArray(data)) {
             stocksData = data;
             const overlay = document.getElementById('loadingOverlay');
-            if (overlay) overlay.style.display = 'none';
+            if (overlay) {
+              if (stocksData.length > 0) {
+                overlay.style.display = 'none';
+              } else if (isQualifiedView) {
+                overlay.innerHTML = '<div style="font-size:16px;color:#f59e0b;display:flex;flex-direction:column;align-items:center;gap:10px"><div class="spinner"></div><span>🎯 暂无量化达标个股或正在等待早盘量化筛查触发...</span></div>';
+                overlay.style.display = 'flex';
+              }
+            }
 
             renderGridCards();
             // 在下一帧统一渲染 Canvas
@@ -650,7 +722,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
       const container = document.getElementById('gridContainer');
       const count = stocksData.length;
 
-      // 自适应十六宫格网格类
+      // 自适应网格类 (针对达标个股 1~16 只智能布局)
       container.className = count <= 1 ? 'grid-1' : (count <= 4 ? 'grid-4' : (count <= 6 ? 'grid-6' : (count <= 9 ? 'grid-9' : (count <= 12 ? 'grid-12' : 'grid-16'))));
 
       // 仅在卡片数量或代码改变时重构 DOM
@@ -669,11 +741,21 @@ FRONTEND_HTML = """<!DOCTYPE html>
           card.setAttribute('data-code', st.code);
           card.id = `card_${st.code}`;
 
+          let triggerBadgeHtml = '';
+          const tInfo = st.trigger_info;
+          if (tInfo && tInfo.trigger_time && tInfo.trigger_time !== '未达标') {
+            const tTime = tInfo.trigger_time;
+            const tPrice = parseFloat(tInfo.trigger_price || st.latest_price).toFixed(2);
+            const recStr = tInfo.recovery_time ? ` · ${tInfo.recovery_time}` : '';
+            triggerBadgeHtml = `<span style="background:linear-gradient(135deg, #b45309, #d97706);color:#fff;font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;border:1px solid #fde047;display:inline-flex;align-items:center;gap:3px;box-shadow:0 0 6px rgba(245,158,11,0.5)">🎯 触发: ${tTime} (￥${tPrice})${recStr}</span>`;
+          }
+
           card.innerHTML = `
             <div class="card-header">
-              <div class="stock-title">
+              <div class="stock-title" style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
                 <span class="stock-name" id="name_${st.code}">${st.name}</span>
                 <span class="stock-code">${st.full_code}</span>
+                ${triggerBadgeHtml}
               </div>
               <div class="stock-price-box">
                 <span class="stock-price" id="price_${st.code}">--</span>
@@ -944,7 +1026,98 @@ FRONTEND_HTML = """<!DOCTYPE html>
         ctx.fillRect(x, yBar, barW, hBar);
       });
 
-      // 8. 交互十字光标与 HUD 提示
+      // 8. 绘制量化触发点位标注 (根据需求：在分时图上精准标注触发时的点位)
+      let triggerCoord = null;
+      const tInfo = st.trigger_info || (st.trigger_time && st.trigger_time !== '未达标' ? {
+        trigger_time: st.trigger_time,
+        trigger_price: st.trigger_price || st.latest_price,
+        score: st.score,
+        recovery_time: st.recovery_time,
+      } : null);
+
+      if (tInfo && tInfo.trigger_time && tInfo.trigger_time !== '未达标') {
+        const tSlot = timeToSlot(tInfo.trigger_time);
+        if (tSlot !== null) {
+          const tX = getX(tSlot);
+          const tPrice = parseFloat(tInfo.trigger_price || st.latest_price);
+          const tY = getYPrice(tPrice);
+          triggerCoord = { x: tX, y: tY, price: tPrice, time: tInfo.trigger_time };
+
+          // (1) 垂直触发预警指示虚线 (鲜明金黄/亮琥珀色高亮贯穿全图)
+          ctx.save();
+          ctx.setLineDash([4, 3]);
+          ctx.strokeStyle = '#f59e0b';
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.moveTo(tX, padding.top);
+          ctx.lineTo(tX, volTop + volH);
+          ctx.stroke();
+          ctx.restore();
+
+          // (2) 触发点位外圈扩散光晕 (Pulse halo)
+          ctx.save();
+          ctx.beginPath();
+          ctx.arc(tX, tY, 10, 0, Math.PI * 2);
+          ctx.fillStyle = 'rgba(245, 158, 11, 0.35)';
+          ctx.fill();
+
+          // 触发点中层高亮实心圈
+          ctx.beginPath();
+          ctx.arc(tX, tY, 5, 0, Math.PI * 2);
+          ctx.fillStyle = '#fbbf24';
+          ctx.fill();
+
+          // 触发点中心亮点
+          ctx.beginPath();
+          ctx.arc(tX, tY, 2, 0, Math.PI * 2);
+          ctx.fillStyle = '#ffffff';
+          ctx.fill();
+          ctx.restore();
+
+          // (3) 悬浮点位标注气泡角标 (Callout Badge)
+          ctx.save();
+          const badgeText = `🎯 触发 ${tInfo.trigger_time} ￥${tPrice.toFixed(2)}`;
+          ctx.font = 'bold 10px monospace, -apple-system, sans-serif';
+          const badgeMetrics = ctx.measureText(badgeText);
+          const badgeW = badgeMetrics.width + 14;
+          const badgeH = 18;
+          let badgeX = tX - badgeW / 2;
+          let badgeY = tY - badgeH - 6;
+
+          // 边缘防溢出校准
+          if (badgeX < padding.left + 2) badgeX = padding.left + 2;
+          if (badgeX + badgeW > w - padding.right - 2) badgeX = w - padding.right - badgeW - 2;
+          if (badgeY < padding.top + 2) badgeY = tY + 8; // 若太靠近顶部则翻转到底部
+
+          // 绘制圆角矩形气泡底色
+          ctx.fillStyle = 'rgba(217, 119, 6, 0.95)';
+          ctx.strokeStyle = '#fde047';
+          ctx.lineWidth = 1.2;
+          ctx.beginPath();
+          const r = 3;
+          ctx.moveTo(badgeX + r, badgeY);
+          ctx.lineTo(badgeX + badgeW - r, badgeY);
+          ctx.quadraticCurveTo(badgeX + badgeW, badgeY, badgeX + badgeW, badgeY + r);
+          ctx.lineTo(badgeX + badgeW, badgeY + badgeH - r);
+          ctx.quadraticCurveTo(badgeX + badgeW, badgeY + badgeH, badgeX + badgeW - r, badgeY + badgeH);
+          ctx.lineTo(badgeX + r, badgeY + badgeH);
+          ctx.quadraticCurveTo(badgeX, badgeY + badgeH, badgeX, badgeY + badgeH - r);
+          ctx.lineTo(badgeX, badgeY + r);
+          ctx.quadraticCurveTo(badgeX, badgeY, badgeX + r, badgeY);
+          ctx.closePath();
+          ctx.fill();
+          ctx.stroke();
+
+          // 绘制文字
+          ctx.fillStyle = '#ffffff';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(badgeText, badgeX + badgeW / 2, badgeY + badgeH / 2);
+          ctx.restore();
+        }
+      }
+
+      // 9. 交互十字光标与 HUD 提示
       const m = mouseState[code];
       if (m && m.active && m.x >= padding.left && m.x <= padding.left + plotW) {
         const hoveredSlot = Math.round(((m.x - padding.left) / plotW) * TOTAL_SLOTS);
@@ -977,17 +1150,25 @@ FRONTEND_HTML = """<!DOCTYPE html>
           const ptColor = ptDiff >= 0 ? '#ff4d4f' : '#00d084';
 
           hud.style.display = 'block';
-          hud.innerHTML = `
+          let hudContent = `
             <div><b>${nearestPt.time}</b></div>
             <div>价: <span style="color:${ptColor};font-weight:bold">${nearestPt.price.toFixed(2)}</span> (${ptPct >= 0 ? '+' : ''}${ptPct.toFixed(2)}%)</div>
             <div>均: <span style="color:#ffd166">${nearestPt.avg.toFixed(2)}</span></div>
             <div>量: <span>${Math.round(nearestPt.vol)}手</span></div>
           `;
+          if (triggerCoord) {
+            hudContent += `
+              <div style="margin-top:4px;padding-top:4px;border-top:1px dashed rgba(245,158,11,0.6)">
+                <span style="color:#fbbf24;font-weight:bold">🎯 触发: ${triggerCoord.time} (￥${triggerCoord.price.toFixed(2)})</span>
+              </div>
+            `;
+          }
+          hud.innerHTML = hudContent;
 
           // HUD 位置动态防溢出
           let hudLeft = crossX + 10;
           let hudTop = crossY - 20;
-          if (hudLeft + 130 > w) hudLeft = crossX - 130;
+          if (hudLeft + 140 > w) hudLeft = crossX - 140;
           if (hudTop < padding.top) hudTop = padding.top;
           hud.style.left = `${hudLeft}px`;
           hud.style.top = `${hudTop}px`;
@@ -1003,7 +1184,7 @@ FRONTEND_HTML = """<!DOCTYPE html>
         alert("请输入至少一个 6 位股票代码！");
         return;
       }
-      fetch('/api/set_stocks', {
+      fetch(BASE_PATH + '/api/set_stocks', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ stocks: codes })
@@ -1016,29 +1197,54 @@ FRONTEND_HTML = """<!DOCTYPE html>
     // 更新多窗口页面元数据与导航标签
     async function updatePagesMeta() {
       try {
-        const resp = await fetch('/api/pages');
+        const resp = await fetch(BASE_PATH + '/api/pages');
         if (resp.ok) {
           const meta = await resp.json();
           const titleEl = document.getElementById('pageTitle');
-          if (titleEl) {
-            if (meta.total_pages > 1) {
-              titleEl.innerText = `A股分时16宫格终端 [窗口 ${currentPage}/${meta.total_pages}]`;
-            } else {
-              titleEl.innerText = `A股实时分时16宫格全景终端`;
-            }
-          }
           const badgeContainer = document.getElementById('pageBadges');
-          if (badgeContainer) {
-            badgeContainer.innerHTML = '';
-            if (meta.total_pages > 1) {
-              for (let p = 1; p <= meta.total_pages; p++) {
-                const a = document.createElement('a');
-                a.className = `page-btn ${p === currentPage ? 'active' : ''}`;
-                a.href = `/?page=${p}`;
-                const count = meta.pages && meta.pages[p-1] ? meta.pages[p-1].count : 0;
-                a.innerText = `窗口 ${p} (${count}只)`;
-                badgeContainer.appendChild(a);
+
+          if (isQualifiedView) {
+            if (titleEl) {
+              titleEl.innerHTML = `<span style="color:#fbbf24;font-weight:700">🎯 早盘量化选股达标个股分时监控 (已标注触发点位)</span>`;
+            }
+            if (badgeContainer) {
+              badgeContainer.innerHTML = `
+                <a class="page-btn active" href="${BASE_PATH}/?view=qualified" style="background:#b45309;border-color:#fde047;color:#fff;font-weight:bold">🎯 达标个股 (${stocksData.length}只)</a>
+                <a class="page-btn" href="${BASE_PATH}/?page=1" style="background:#1e293b;border-color:#38bdf8;color:#38bdf8;font-weight:600">🔙 返回 16 宫格全景</a>
+              `;
+            }
+          } else {
+            if (titleEl) {
+              if (meta.total_pages > 1) {
+                titleEl.innerText = `A股分时16宫格终端 [窗口 ${currentPage}/${meta.total_pages}]`;
+              } else {
+                titleEl.innerText = `A股实时分时16宫格全景终端`;
               }
+            }
+            if (badgeContainer) {
+              badgeContainer.innerHTML = '';
+              if (meta.total_pages > 1) {
+                for (let p = 1; p <= meta.total_pages; p++) {
+                  const a = document.createElement('a');
+                  a.className = `page-btn ${p === currentPage ? 'active' : ''}`;
+                  a.href = `${BASE_PATH}/?page=${p}`;
+                  const count = meta.pages && meta.pages[p-1] ? meta.pages[p-1].count : 0;
+                  a.innerText = `窗口 ${p} (${count}只)`;
+                  badgeContainer.appendChild(a);
+                }
+              }
+              // 若有量化达标个股，提供醒目的直达黄色按钮
+              const qCount = meta.qualified_count || 0;
+              const qBtn = document.createElement('a');
+              qBtn.className = 'page-btn';
+              qBtn.href = `${BASE_PATH}/?view=qualified`;
+              qBtn.target = '_blank';
+              qBtn.style.background = 'rgba(245, 158, 11, 0.22)';
+              qBtn.style.borderColor = '#f59e0b';
+              qBtn.style.color = '#fbbf24';
+              qBtn.style.fontWeight = 'bold';
+              qBtn.innerText = `🎯 达标个股网格 (${qCount}只)`;
+              badgeContainer.appendChild(qBtn);
             }
           }
         }
@@ -1079,23 +1285,35 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
         path = parsed_url.path
         qs = parse_qs(parsed_url.query)
 
-        if path in ("/", "/index.html"):
+        if path in ("/", "/index.html", "/qualified"):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(FRONTEND_HTML.encode("utf-8"))
 
         elif path == "/api/stocks":
-            page_str = qs.get("page", [None])[0]
-            if page_str is not None and page_str != "all":
-                try:
-                    page_num = int(page_str)
-                except ValueError:
-                    page_num = 1
-                data = data_hub.get_page_data(page=page_num, page_size=16)
+            mode = qs.get("view", qs.get("mode", [None]))[0]
+            if mode == "qualified":
+                data = data_hub.get_trigger_stocks_data()
             else:
-                data = data_hub.get_all_data()
+                page_str = qs.get("page", [None])[0]
+                if page_str is not None and page_str != "all":
+                    try:
+                        page_num = int(page_str)
+                    except ValueError:
+                        page_num = 1
+                    data = data_hub.get_page_data(page=page_num, page_size=16)
+                else:
+                    data = data_hub.get_all_data()
 
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(data, ensure_ascii=False).encode("utf-8"))
+
+        elif path == "/api/trigger_stocks":
+            data = data_hub.get_trigger_stocks_data()
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Access-Control-Allow-Origin", "*")
@@ -1104,6 +1322,7 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
 
         elif path == "/api/pages":
             meta = data_hub.get_pages_meta()
+            meta["qualified_count"] = len(data_hub.trigger_stocks)
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Access-Control-Allow-Origin", "*")
@@ -1139,6 +1358,26 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 self.send_response(400)
                 self.end_headers()
+
+        elif path == "/api/set_trigger_stocks":
+            content_length = int(self.headers.get("Content-Length", 0))
+            post_body = self.rfile.read(content_length)
+            try:
+                req_data = json.loads(post_body.decode("utf-8"))
+                new_stocks = req_data.get("stocks", [])
+                data_hub.set_trigger_stocks(new_stocks)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    "status": "ok",
+                    "count": len(data_hub.trigger_stocks),
+                    "codes": list(data_hub.trigger_stocks.keys())
+                }, ensure_ascii=False).encode("utf-8"))
+            except Exception as e:
+                self.send_response(400)
+                self.end_headers()
         else:
             self.send_response(404)
             self.end_headers()
@@ -1160,12 +1399,13 @@ def start_server():
 
     server_address = (HTTP_HOST, WEB_PORT)
     try:
-        httpd = HTTPServer(server_address, WebDashboardHandler)
+        httpd = ThreadingHTTPServer(server_address, WebDashboardHandler)
         meta = data_hub.get_pages_meta()
         print(f"🚀 A股实时分时16宫格网页终端已启动!")
         print(f"📊 当前共监控 {meta['total_stocks']} 只股票，分布在 {meta['total_pages']} 个16宫格窗口：")
         for p in meta["pages"]:
             print(f"  👉 窗口 {p['page']}: {p['url']} (包含 {p['count']} 只标的: {p['symbols']})")
+        print(f"🎯 达标个股独立分时网格地址: http://{DISPLAY_HOST}:{WEB_PORT}/?view=qualified (已同步 {len(data_hub.trigger_stocks)} 只标的)")
         print(f"💡 提示: 超过16只股票将自动生成新窗口展示，各Agent节点将自动轮询抓取所有窗口。")
         print("=" * 70 + "\n")
 
@@ -1173,17 +1413,21 @@ def start_server():
         polling_thread = threading.Thread(target=data_hub.polling_loop, daemon=True)
         polling_thread.start()
 
-        # 自动调用系统默认浏览器打开所有窗口
-        for p in meta["pages"]:
-            threading.Timer(0.8 * p["page"], lambda u=p["url"]: webbrowser.open(u)).start()
+        # 自动调用系统默认浏览器打开所有窗口 (若配置 NO_BROWSER 则静默启动)
+        no_browser = os.environ.get("NO_BROWSER", "0") == "1"
+        if not no_browser:
+            for p in meta["pages"]:
+                threading.Timer(0.8 * p["page"], lambda u=p["url"]: webbrowser.open(u)).start()
 
         httpd.serve_forever()
     except OSError as e:
         if e.errno == 98 or "address already in use" in str(e).lower() or "10048" in str(e):
             alt_port = WEB_PORT + 1
             print(f"[提示] 端口 {WEB_PORT} 被占用，切换至端口 {alt_port}...")
-            httpd = HTTPServer((HTTP_HOST, alt_port), WebDashboardHandler)
-            threading.Timer(0.8, lambda: webbrowser.open(f"http://{HTTP_HOST}:{alt_port}")).start()
+            httpd = ThreadingHTTPServer((HTTP_HOST, alt_port), WebDashboardHandler)
+            no_browser = os.environ.get("NO_BROWSER", "0") == "1"
+            if not no_browser:
+                threading.Timer(0.8, lambda: webbrowser.open(f"http://{DISPLAY_HOST}:{alt_port}")).start()
             httpd.serve_forever()
         else:
             raise e

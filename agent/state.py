@@ -38,6 +38,7 @@ class ResearchState(TypedDict, total=False):
     # === node4 产出 (参考 stock_quant.py) ===
     grid_quant_analysis: str          # 16宫格早盘量化回踩与承接筛选技术研报
     qualified_stocks: List[dict]      # 技术面强力符合战法的股票清单
+    qualified_dashboard_url: Optional[str]  # 触发量化条件时生成的符合条件个股分时图网格终端地址 (已标注触发点位)
 
     # === node5 产出 ===
     news_analysis: str                # 消息面、催化剂与行业舆情分析研报

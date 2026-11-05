@@ -409,7 +409,7 @@ def extract_top_stock_from_state(state: Dict[str, Any]) -> Optional[Dict[str, An
     if os.path.exists(csv_path):
         try:
             import pandas as pd
-            df = pd.read_csv(csv_path, dtype={"股票代码": str})
+            df = pd.read_csv(csv_path, dtype={"股票代码": str}, encoding="utf-8-sig")
             if not df.empty:
                 return df.iloc[0].to_dict()
         except Exception:
